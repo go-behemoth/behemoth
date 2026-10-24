@@ -246,3 +246,64 @@ func TestArgon2idHasher_VerifyTakesTheStoredHashsMemory(t *testing.T) {
 		assert.True(t, ok, name)
 	}
 }
+
+// A zero field of Params takes DefaultParams' value, nil being all zero.
+// The hasher keeps a copy, and leaves the caller's Params as it was.
+func TestParams_ZeroFieldsTakeTheDefaults(t *testing.T) {
+	km := newPasswordKeys(t)
+	for name, tc := range map[string]struct {
+		params *Params
+		want   Params
+	}{
+		"nil":          {nil, *DefaultParams},
+		"all zero":     {&Params{}, *DefaultParams},
+		"memory alone": {&Params{Memory: 19 * 1024}, Params{Memory: 19 * 1024, Iterations: 3, Parallelism: 4, SaltLength: 16, KeyLength: 32}},
+		"complete":     {cheapParams, *cheapParams},
+	} {
+		h := newHasher(t, km, tc.params, PasswordLimit{}, nil)
+		assert.Equal(t, tc.want, *h.params, name)
+		assert.NotSame(t, DefaultParams, h.params, name)
+	}
+
+	// Before the fix, the zero salt and key lengths of this Params hashed
+	// with no salt and panicked inside argon2.
+	partial := &Params{Memory: 1024, Iterations: 1, Parallelism: 1}
+	h := newHasher(t, km, partial, PasswordLimit{}, nil)
+	assert.Equal(t, Params{Memory: 1024, Iterations: 1, Parallelism: 1}, *partial, "the caller's Params changed")
+	hash, err := h.Hash(t.Context(), "password")
+	require.NoError(t, err)
+	_, _, salt, key, err := decodeHash(hash)
+	require.NoError(t, err)
+	assert.Len(t, salt, 16)
+	assert.Len(t, key, 32)
+	ok, err := h.Verify(t.Context(), hash, "password")
+	require.NoError(t, err)
+	assert.True(t, ok)
+}
+
+// A salt or a key under 16 bytes, and a memory under 8 KiB a lane, are
+// configuration errors from the constructor and from New. The floors
+// themselves are accepted.
+func TestParams_Floors(t *testing.T) {
+	km := newPasswordKeys(t)
+	for name, params := range map[string]*Params{
+		"short salt":             {SaltLength: 8},
+		"short key":              {KeyLength: 8},
+		"memory under the lanes": {Memory: 16, Parallelism: 4},
+		"memory under one lane":  {Memory: 4, Parallelism: 1},
+	} {
+		_, err := NewArgon2idHasher(params, PasswordLimit{}, km, nil)
+		assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%s: %v", name, err)
+
+		_, err = New(t.Context(), Config{Secrets: NewSecretSource(nil), Password: params}, nil)
+		assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%s: %v", name, err)
+	}
+
+	floors := &Params{Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 16}
+	h := newHasher(t, km, floors, PasswordLimit{}, nil)
+	hash, err := h.Hash(t.Context(), "password")
+	require.NoError(t, err)
+	ok, err := h.Verify(t.Context(), hash, "password")
+	require.NoError(t, err)
+	assert.True(t, ok)
+}

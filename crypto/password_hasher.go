@@ -20,23 +20,77 @@ import (
 	"github.com/go-behemoth/behemoth/telemetry"
 )
 
-// Params holds the Argon2id configuration.
+// Params holds the Argon2id configuration. A zero field takes the value of
+// DefaultParams, so a Params that sets only Memory is complete.
+//
+// NewArgon2idHasher refuses, as a configuration error, a SaltLength or a
+// KeyLength under 16 bytes, and a Memory under 8 KiB per lane
+// (Parallelism), the least Argon2id allows. These floors apply to the
+// hasher's own params: a stored hash made with other params still verifies.
 type Params struct {
 	Memory      uint32 // KiB
 	Iterations  uint32
 	Parallelism uint8
-	SaltLength  uint32
-	KeyLength   uint32
+	SaltLength  uint32 // bytes
+	KeyLength   uint32 // bytes
 }
 
 // DefaultParams provides reasonable interactive defaults
-// (≈64 MiB, 3 iterations, parallelism 4).
+// (≈64 MiB, 3 iterations, parallelism 4). A zero field of a Params takes its
+// value from here.
 var DefaultParams = &Params{
 	Memory:      64 * 1024,
 	Iterations:  3,
 	Parallelism: 4,
 	SaltLength:  16,
 	KeyLength:   32,
+}
+
+// The floors of Params, in bytes. RFC 9106 recommends a 128-bit salt for
+// password hashing, and a key of 128 bits or more.
+const (
+	minSaltLength = 16
+	minKeyLength  = 16
+)
+
+// withDefaults returns a copy of p with its zero fields taken from
+// DefaultParams; a nil p is all zero. A value under a floor is a
+// configuration error, reported when the hasher is built and not at the
+// first sign-in: argon2 panics on zero iterations or a zero key length,
+// hashes without a salt on a zero salt length, and silently raises a memory
+// under 8 KiB per lane, so the hash string would not say what ran.
+func (p *Params) withDefaults() (*Params, error) {
+	out := *DefaultParams
+	if p != nil {
+		if p.Memory != 0 {
+			out.Memory = p.Memory
+		}
+		if p.Iterations != 0 {
+			out.Iterations = p.Iterations
+		}
+		if p.Parallelism != 0 {
+			out.Parallelism = p.Parallelism
+		}
+		if p.SaltLength != 0 {
+			out.SaltLength = p.SaltLength
+		}
+		if p.KeyLength != 0 {
+			out.KeyLength = p.KeyLength
+		}
+	}
+
+	var problem string
+	switch {
+	case out.SaltLength < minSaltLength:
+		problem = fmt.Sprintf("SaltLength %d is under %d bytes", out.SaltLength, minSaltLength)
+	case out.KeyLength < minKeyLength:
+		problem = fmt.Sprintf("KeyLength %d is under %d bytes", out.KeyLength, minKeyLength)
+	case out.Memory < 8*uint32(out.Parallelism):
+		problem = fmt.Sprintf("Memory %d KiB is under 8 KiB for each of the %d lanes", out.Memory, out.Parallelism)
+	default:
+		return &out, nil
+	}
+	return nil, errs.NewConfigurationError("crypto.Params", "the password hash params are invalid: "+problem, nil)
 }
 
 // PasswordLimit bounds the password hashes that run at once in one process.
@@ -103,13 +157,16 @@ type Argon2idHasher struct {
 
 // NewArgon2idHasher returns a hasher that uses the supplied parameters and
 // bounds its concurrent hashes with limit. If params is nil, DefaultParams
-// is used. tel may be nil. A negative field of limit is a configuration
-// error.
+// is used, and a zero field of params takes DefaultParams' value. The hasher
+// keeps a copy, so a later change to params does not reach it. tel may be
+// nil. Params under their floors (see [Params]) and a negative field of
+// limit are configuration errors.
 func NewArgon2idHasher(params *Params, limit PasswordLimit, km KeyManager, tel *telemetry.Telemetry) (*Argon2idHasher, error) {
-	if params == nil {
-		params = DefaultParams
+	params, err := params.withDefaults()
+	if err != nil {
+		return nil, err
 	}
-	limit, err := limit.withDefaults()
+	limit, err = limit.withDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +249,9 @@ func (h *Argon2idHasher) Verify(ctx context.Context, hash, password string) (ok 
 }
 
 // deriveKey runs Argon2id with params once there is room for it. The room
-// is given back by a defer, so a panic in argon2 does not keep it.
+// is given back by a defer, so a panic in argon2 does not keep it. The
+// hasher's own params can't cause one (Params.withDefaults); a stored hash
+// whose params were edited in the database can.
 func (h *Argon2idHasher) deriveKey(ctx context.Context, op string, password, salt []byte, params *Params) ([]byte, error) {
 	release, err := h.acquire(ctx, op, params.Memory)
 	if err != nil {

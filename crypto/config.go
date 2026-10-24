@@ -16,7 +16,9 @@ type Config struct {
 	Secrets    SecretSource
 	KeyManager KeyManagerConfig
 
-	// Password tunes Argon2id password hashing. nil = DefaultParams.
+	// Password tunes Argon2id password hashing. nil, or a zero field,
+	// means the value of DefaultParams. See [Params] for the values that
+	// are refused.
 	Password *Params
 
 	// PasswordLimit bounds the password hashes that run at once. The zero
@@ -33,6 +35,9 @@ func New(ctx context.Context, cfg Config, tel *telemetry.Telemetry) (Services, e
 	}
 	// Checked before the key manager starts its watch, which would outlive
 	// a failed New until ctx ends.
+	if _, err := cfg.Password.withDefaults(); err != nil {
+		return Services{}, err
+	}
 	if _, err := cfg.PasswordLimit.withDefaults(); err != nil {
 		return Services{}, err
 	}

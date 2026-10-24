@@ -21,6 +21,24 @@ $argon2id$v=19$m=65536,t=3,p=4,kv=1$<salt>$<key>
 
 `kv` is the pepper's version, so `Verify` takes the key of the version the hash was made with. A hash without `kv` is read as version 0. `Verify` runs Argon2id with the params in the string, not the hasher's, and compares in constant time.
 
+### Params
+
+`Config.Password` is a `*Params`. `Params.withDefaults` fills each zero field from `DefaultParams`, so a configuration that sets only `Memory` is complete, as [`../guidelines/service_ready_components.md`](../guidelines/service_ready_components.md) asks of every option. The hasher keeps that copy, not the caller's struct. `New` and `NewArgon2idHasher` refuse these values with a configuration error:
+
+| Value | Why |
+| --- | --- |
+| `SaltLength` under 16 bytes | RFC 9106 recommends a 128-bit salt for passwords. Until 2026-10-24 a zero salt length hashed with an empty salt, so equal passwords had equal hashes under one pepper version. |
+| `KeyLength` under 16 bytes | A key under 128 bits. A zero key length panicked inside `argon2` at the first hash. |
+| `Memory` under 8 KiB times `Parallelism` | The least Argon2id allows. `argon2` raises a smaller value silently, so the hash string would record less memory than ran, and the bound would count less. |
+
+A zero `Iterations` also panicked at the first hash, and now takes the default.
+
+`Memory` and `Iterations` have no floor above Argon2id's own. They trade memory for passes (OWASP lists several equivalent pairs), and the tests run with 1 MiB and one pass.
+
+The floors apply to the hasher's own params. `Verify` runs with the params written in the stored hash, so a hash made before a change still verifies.
+
+### Rehashing
+
 `NeedsRehash` reports a hash made with weaker params or an older pepper. `[Not built]` Sign-in does not call it, so a stored hash keeps its params until the user sets a new password.
 
 ## The bound on hashes in flight
@@ -43,7 +61,7 @@ Each running hash holds `Params.Memory`. `Argon2idHasher` holds a weighted semap
 
 The semaphore serves waiters in order, so a verify of a large stored hash is not overtaken by small hashes indefinitely. Every call records its wait in `behemoth.password.wait`, zero when it found room at once.
 
-`deriveKey` gives the room back with a `defer`. `argon2.IDKey` panics on some params, such as zero iterations; a panic does not keep the room.
+`deriveKey` gives the room back with a `defer`. `argon2.IDKey` panics on some params, such as zero iterations. The hasher's own params can't have them, but a stored hash edited in the database can, and a panic does not keep the room.
 
 `[Limit]` A hash that has started runs to the end. `argon2.IDKey` takes no context.
 
