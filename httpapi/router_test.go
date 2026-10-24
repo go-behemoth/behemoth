@@ -243,8 +243,9 @@ func TestRouterRequestID(t *testing.T) {
 	if got := serve(rt, nil, header, "client-id-1"); got != "client-id-1" || seen != "client-id-1" {
 		t.Errorf("echoed %q, handler saw %q; want client-id-1 for both", got, seen)
 	}
-	// An unusable value is replaced.
-	if got := serve(rt, nil, header, "bad id\twith spaces"); got == "" || got != seen || !telemetry.ValidRequestID(got) || strings.Contains(got, "bad") {
+	// An unusable value is replaced, not cleaned up. The marker has letters
+	// outside a-f, so a generated ID, which is hex, can't contain it.
+	if got := serve(rt, nil, header, "invalid id\twith spaces"); got == "" || got != seen || !telemetry.ValidRequestID(got) || strings.Contains(got, "invalid") {
 		t.Errorf("echoed %q, handler saw %q; want one generated ID", got, seen)
 	}
 	// No header: one is generated.
