@@ -208,9 +208,11 @@ func (r *Router) Routes() []Route {
 // wrapWithErrorMapping turns an error returned by route's chain into a
 // response, and logs it. This is the one place a request's failure is
 // logged, so components below return their errors without logging them. A
-// 5xx is logged at Error: behemoth failed at something it owed. Anything
-// else is a rejection of the request (a wrong password, a rate limit) and is
-// logged at Debug.
+// 5xx is logged at Error: behemoth failed at something it owed. An
+// unavailable error, such as a busy password hasher, is logged at Warn: the
+// process refused work it had no room for, and a burst of these must not
+// bury real failures. Anything else is a rejection of the request (a wrong
+// password, a rate limit) and is logged at Debug.
 func (r *Router) wrapWithErrorMapping(route Route, next HandlerFunc) HandlerFunc {
 	return func(rctx *RequestContext) error {
 		if err := next(rctx); err != nil {
@@ -220,10 +222,13 @@ func (r *Router) wrapWithErrorMapping(route Route, next HandlerFunc) HandlerFunc
 				telemetry.FieldRoute:  route.Path,
 				telemetry.FieldStatus: status,
 			})
-			if status >= 500 {
+			switch {
+			case errs.IsCategory(err, errs.CategoryUnavailable):
+				r.log.Warn(rctx.Ctx, "request refused: no capacity", fields)
+			case status >= 500:
 				telemetry.SpanFrom(rctx.Ctx).RecordError(err)
 				r.log.Error(rctx.Ctx, "request failed", fields)
-			} else {
+			default:
 				r.log.Debug(rctx.Ctx, "request rejected", fields)
 			}
 			if de, ok := errors.AsType[*errs.DomainError](err); ok && de.RetryAfter > 0 {

@@ -438,7 +438,9 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 	}
 	_, err := ac.Store.FindUserByEmail(hctx.Ctx, email)
 	if err == nil {
-		hashPassword(hctx, password) // timing mitigation, unchanged
+		if err := decoyHash(hctx, password); err != nil {
+			return nil, err
+		}
 		return nil, emailTaken()
 	}
 	if !errs.IsNotFound(err) {
@@ -499,15 +501,22 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 	return user, nil
 }
 
-// hashPassword hashes password inside a span. Hashing is the slowest step of
-// a sign-up and of a refused sign-in, where it runs to keep the response
-// time the same, so a trace shows it by name. The span lives here and not in
-// the hasher because PasswordHasher's methods take no context.
+// hashPassword hashes password with the AuthContext's hasher, under the
+// operation's context. The hasher traces the hash and bounds how many run at
+// once, so it can refuse with a busy error (errs.CodeServerBusy).
 func hashPassword(hctx *core.HookContext, password string) (string, error) {
-	_, span := hctx.Auth.Telemetry.StartSpan(hctx.Ctx, telemetry.SpanPasswordHash, nil)
-	hash, err := hctx.Auth.Crypto.Passwords.Hash(password)
-	telemetry.FinishSpan(span, err)
-	return hash, err
+	return hctx.Auth.Crypto.Passwords.Hash(hctx.Ctx, password)
+}
+
+// decoyHash hashes a password that is thrown away, so that an answer takes
+// as long as one that hashes: a sign-in refused before any password was
+// checked, and a sign-up for a taken email. Its error is returned to the
+// caller, as Verify's and a real hash's are: a busy hasher then answers 503
+// for an unknown email as for a known one, and the answer doesn't tell which
+// emails have an account. See ADR-0010.
+func decoyHash(hctx *core.HookContext, password string) error {
+	_, err := hashPassword(hctx, password)
+	return err
 }
 
 // ErrorCodeInvalidCredentials is the code of the error sign-in returns for an
@@ -536,8 +545,10 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 	errInvalidCredentials := func() error { return errInvalidCredentials(creds.Key) }
 	user, err := creds.Find(hctx.Ctx, ac.Store, creds.Value)
 	if err != nil {
-		hashPassword(hctx, creds.Password) // timing mitigation
 		if errs.IsNotFound(err) {
+			if err := decoyHash(hctx, creds.Password); err != nil {
+				return nil, err
+			}
 			attempted := creds.Value
 			if creds.normalize != nil {
 				attempted = creds.normalize(attempted)
@@ -563,8 +574,10 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 	// match, and is answered exactly like a wrong password.
 	credential, err := ac.Store.FindAccount(hctx.Ctx, models.ProviderCredential, user.ID)
 	if err != nil {
-		hashPassword(hctx, creds.Password) // timing mitigation
 		if errs.IsNotFound(err) {
+			if err := decoyHash(hctx, creds.Password); err != nil {
+				return nil, err
+			}
 			if err := dispatcher.Fail(hctx, hooks.HookSignInFailed, rejected("no_credential_account", nil)); err != nil {
 				return nil, err
 			}
@@ -573,11 +586,9 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 		return nil, err // infra error — must NOT count toward lockout
 	}
 
-	_, span := ac.Telemetry.StartSpan(hctx.Ctx, telemetry.SpanPasswordVerify, nil) // the hasher takes no context; the span times the call
-	isValid, err := hasher.Verify(credential.PasswordHash, creds.Password)
-	telemetry.FinishSpan(span, err)
+	isValid, err := hasher.Verify(hctx.Ctx, credential.PasswordHash, creds.Password)
 	if err != nil {
-		return nil, err // a malformed stored hash or key error — not a wrong password, so not counted as one
+		return nil, err // a busy hasher, a malformed stored hash or a key error — not a wrong password, so not counted as one
 	}
 
 	if !isValid {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/go-behemoth/behemoth"
 	"github.com/go-behemoth/behemoth/errs"
@@ -21,7 +22,9 @@ func TestDefaultErrorMapper(t *testing.T) {
 	}{
 		"a session error": {errs.NewSessionError("test", errs.CodeSessionExpired, nil), http.StatusUnauthorized,
 			behemoth.M{"error": "session expired", "code": errs.CodeSessionExpired}},
-		"a rate limit":          {errs.NewRateLimited("test", "rule", 0), http.StatusTooManyRequests, nil},
+		"a rate limit": {errs.NewRateLimited("test", "rule", 0), http.StatusTooManyRequests, nil},
+		"a busy server": {errs.NewUnavailable("test", errs.CodeServerBusy, "server busy", time.Second), http.StatusServiceUnavailable,
+			behemoth.M{"error": "server busy", "code": errs.CodeServerBusy}},
 		"a configuration error": {errs.NewConfigurationError("test", "a mistake", nil), http.StatusInternalServerError, internal},
 		"an untyped error":      {errors.New("boom"), http.StatusInternalServerError, internal},
 		"a wrapped typed error": {errors.Join(errors.New("context"), errs.NewForbidden("test", errs.CodeInsufficientScope, "no")), http.StatusForbidden, nil},

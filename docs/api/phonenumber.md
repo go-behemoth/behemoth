@@ -103,6 +103,7 @@ Body keys are snake case.
 | `sign-in/phone-number` | nobody holds the number, wrong password, or a user without a password | `401` | `invalid_credentials` |
 | `reset-password` | the password fails the email/password plugin's rules | `400` | `password_invalid_input`. The code keeps its attempts. |
 | any | more than 10 requests a minute from one client address | `429` | `rate_limited` |
+| `sign-in/phone-number`, `reset-password` | too many passwords are being hashed at once; see [Bound the password hashes that run at once](emailpassword.md#bound-the-password-hashes-that-run-at-once) | `503` with `Retry-After` | `server_busy` |
 
 **What the responses do not show:**
 

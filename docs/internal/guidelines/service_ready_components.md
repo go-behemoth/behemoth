@@ -100,6 +100,8 @@ With several replicas, a request reaches any of them, and a replica can disappea
 
 Memory is fine for what may be lost or may differ between replicas, such as a cache with a short life. It does not suit a count that a limit depends on, or work that was accepted and not yet done.
 
+A bound on the process's own resources is the exception, and belongs in memory. The password hasher's bound on hashes in flight (`crypto.PasswordLimit`) protects the memory of one replica, which no other replica shares. A count in Redis could not tell which replica holds the memory, and would add a round trip to every sign-in. See [ADR-0010](../decisions/0010-bounding-concurrent-password-hashes.md).
+
 ### Core reads no environment, file, or flag
 
 Settings arrive as values. `Boot` and the plugins read no environment variable. The composition root does: the application's `main` today, the service's `main` later. The migration code reads the migration folder, whose path it was given.

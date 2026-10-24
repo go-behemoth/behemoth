@@ -95,6 +95,7 @@ A `409` shows that a username exists, as the email/password plugin's `email_take
 | `username` or `password` is not a string | `400` | `username_invalid_input`, `password_invalid_input` |
 | the body is not valid JSON | `400` | `request_validation_error` |
 | more than 10 attempts a minute from one client address | `429` with `Retry-After` | `rate_limited` |
+| too many passwords are being hashed at once; see [Bound the password hashes that run at once](emailpassword.md#bound-the-password-hashes-that-run-at-once) | `503` with `Retry-After` | `server_busy` |
 
 The `401` is the same for the three refusals, so the response does not show which usernames exist. Its code is `emailpassword.ErrorCodeInvalidCredentials`, the code of a refused email sign-in. The username is matched in any casing. An email address in the `username` field finds no user: use `POST /sign-in/email` for that.
 

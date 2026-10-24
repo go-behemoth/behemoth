@@ -462,6 +462,7 @@ func TestIsSystemFailure(t *testing.T) {
 		{errs.NewInternalError("op", errors.New("x")), true},
 		{errs.NewNotFound("op", "user", nil), false},
 		{errs.NewRateLimited("op", "rule", 0), false},
+		{errs.NewUnavailable("op", errs.CodeServerBusy, "busy", 0), false},
 		{fmt.Errorf("wrapped: %w", errs.NewDuplicateKey("op", "user", nil)), false},
 	} {
 		if got := telemetry.IsSystemFailure(tc.err); got != tc.want {

@@ -65,6 +65,13 @@ const (
 
 	MetricMailSent = "behemoth.mail.sent" // counter: messages handed to the mail sender, by kind and result
 	MetricSMSSent  = "behemoth.sms.sent"  // counter: messages handed to the SMS sender, by kind and result
+
+	// MetricPasswordWait is how long each password hash or verify waited for
+	// room under the hasher's bound (crypto.PasswordLimit): zero when there
+	// was room at once. MetricPasswordBusy counts the calls that waited the
+	// whole MaxWait and were refused with server_busy.
+	MetricPasswordWait = "behemoth.password.wait" // histogram, seconds
+	MetricPasswordBusy = "behemoth.password.busy" // counter
 )
 
 // Attribute keys of the metrics above.

@@ -7,7 +7,7 @@ This document describes how Behemoth's performance is measured. It records the f
 The documents it builds on are:
 
 - [`../guidelines/service_ready_components.md`](../guidelines/service_ready_components.md): a component stays right with several replicas. The load tests check that under load.
-- [`../guidelines/transport_neutral_flows.md`](../guidelines/transport_neutral_flows.md): rules and protections live in the flow. The flow benchmarks call flows in the process as well as through routes, and a bound on password hashes (M28) belongs in the flow.
+- [`../guidelines/transport_neutral_flows.md`](../guidelines/transport_neutral_flows.md): rules and protections live in the flow. The flow benchmarks call flows in the process as well as through routes. The bound on password hashes (`crypto.PasswordLimit`, [ADR-0010](../decisions/0010-bounding-concurrent-password-hashes.md)) is in the hasher, below every flow, so it holds for both.
 - [`../ratelimit/rate_limiter.md`](../ratelimit/rate_limiter.md): the counters that every limited request reads and writes.
 - [`../telemetry/metrics.md`](../telemetry/metrics.md): the metrics that the budgets and the load tests read.
 - [`package_layout.md`](package_layout.md) and [ADR-0007](../decisions/0007-layering-the-packages.md): the layering that `layout_test.go` checks. The dependency allowlist goes next to it.
@@ -56,7 +56,7 @@ Behemoth is a library, so its performance is what an application gets through it
 - Comparing Behemoth with other authentication libraries.
 - Tuning the databases or their drivers. The tests use their defaults, except the connection pool (see [Size the connection pool](#size-the-connection-pool)).
 - Publishing performance numbers in the API docs. The numbers here are for maintainers, and they depend on the machine.
-- Fixing what the measurements found. M28, L55, and L56 in `docs/ongoing.md` track it, and the tests here measure the fixes.
+- Fixing what the measurements found. L55 and L56 in `docs/ongoing.md` track it, and the tests here measure the fixes. M28, the unbounded hashes, was fixed on 2026-10-24 ([ADR-0010](../decisions/0010-bounding-concurrent-password-hashes.md)).
 
 ## First measurements
 
@@ -122,7 +122,7 @@ The table shows these points:
 - With one P, a hash takes 80 ms. `DefaultParams` asks for four lanes (`Parallelism: 4`), and one P runs them one after another. The 33 ms of the previous table spread the lanes over 24 Ps.
 - Throughput grows much less than the number of Ps: 24 hashes in flight give 68 hashes a second, against 41 with 4. The machine's 24 threads include hyper-threads and efficient cores, and Argon2id is designed to be bound by memory bandwidth. Which of these limits it here was not measured.
 - Peak RSS is about 2.2 times the live hash memory at every level. That matches Go's default `GOGC=100`, which lets the heap grow to twice the live data before a collection. Each hash's 64 MiB becomes garbage when the hash returns, and stays in the heap until the next collection.
-- Nothing bounds the hashes in flight (M28). Core's limits count per client address, so requests from many addresses start as many hashes as there are requests. 200 sign-ins in flight hold 12.5 GiB of live hash memory, and about twice that in RSS at the default `GOGC`.
+- Nothing bounded the hashes in flight when this was measured. Core's limits count per client address, so requests from many addresses started as many hashes as there were requests. 200 sign-ins in flight would hold 12.5 GiB of live hash memory, and about twice that in RSS at the default `GOGC`. Since 2026-10-24, `crypto.PasswordLimit` bounds them per process, at `GOMAXPROCS` hashes by default ([ADR-0010](../decisions/0010-bounding-concurrent-password-hashes.md)).
 - `GOMEMLIMIT` makes the collector run sooner as the heap nears the limit. It trades CPU for memory, and it does not bound the live memory.
 
 ### Sign-in timing parity
@@ -285,7 +285,7 @@ The numbers show these points:
 ### What the measurements say
 
 - Behemoth's cost has two parts. A password flow is bound by Argon2id, in CPU and in memory. Every other flow is bound by its database calls. Behemoth's own code is a small share of either.
-- The largest risk is memory under concurrent password flows (M28), not speed.
+- The largest risk was memory under concurrent password flows, not speed. `crypto.PasswordLimit` bounds it since 2026-10-24.
 - The database calls of a flow are few and can be counted exactly, which makes them the best regression check.
 - Sign-in timing parity holds in the process. It needs a check over a network.
 - Size has no large reduction to offer. The checks keep it where it is and show growth.
@@ -463,7 +463,7 @@ The limiter then counts as it does in production. A scenario that measures somet
 | # | Scenario | Traffic | What to watch |
 | --- | --- | --- | --- |
 | 1 | Session checks | A protected route at a rising rate | The rate at which p99 latency passes its limit. PostgreSQL connections in use. CPU per replica. Cache hits and misses in `behemoth.session.validated`. |
-| 2 | Sign-in burst | 10, then 50, 100, 200, and 500 sign-ins at once | Peak RSS, out-of-memory kills, 5xx answers, and p99. It shows M28, and after its fix, the bound at work. |
+| 2 | Sign-in burst | 10, then 50, 100, 200, and 500 sign-ins at once | Peak RSS, out-of-memory kills, 5xx answers, and p99. It shows the bound of `crypto.PasswordLimit` at work: peak RSS stays flat as the burst grows, and what does not fit in `MaxWait` gets `503` with `server_busy`. |
 | 3 | Mixed workload | 1 sign-up for 10 sign-ins and 1,000 protected requests, for 30 minutes | p50, p95, and p99 per route. Error rate. Database calls per second. |
 | 4 | One hot counter | Many requests on one rate-limit key, with the database counter and with Redis | Rate-limit operations per check in `behemoth.store.duration`, where each lost race adds a read and a write. Checks that end in `error` in `behemoth.ratelimit.checks`, which fail open by default. |
 | 5 | Several replicas | Scenario 3 on two replicas, with sign-outs and revocations during the run | Counts shared across replicas. A revoked session refused on every replica within the cache's lifetime (M6). |
@@ -518,7 +518,7 @@ The API docs can give applications this advice, in [step 7](#implementation-step
 
 - Build with `-trimpath -ldflags="-s -w"`, which removes about 30% of the program.
 - Size the database pool for the queries that run at once: `SetMaxIdleConns` at least as high as the expected concurrency.
-- Plan memory for the password flows: hashes in flight, times `Params.Memory`, times about two at the default `GOGC`, until M28 adds a bound.
+- Plan memory for the password flows: `PasswordLimit.MaxConcurrent`, times `Params.Memory`, times about two at the default `GOGC`. In a container without a CPU limit, set `MaxConcurrent` (M32).
 - Profile-guided optimization (a `default.pgo` in the main package) is the application's choice. It gains little here: Argon2id is assembly on amd64, and the rest is database calls.
 
 ## CI
@@ -576,7 +576,7 @@ A closed-model generator waits for each response before it sends the next reques
 - **The machine for load tests.** It has to be the same machine each time, with fixed power settings: a self-hosted runner, or a cloud machine of a fixed type. Who owns it is open.
 - **The pass criteria of the load scenarios.** They are set after the first baseline. For example, the rate at which p99 passes its limit must not drop by more than 10%.
 - **Why session check throughput on SQLite falls past 8 goroutines.** The profile shows cgo calls and runtime spinning, not Behemoth. The flow benchmark on PostgreSQL shows whether Behemoth scales past that point.
-- **The default Argon2id parameters.** `DefaultParams` is the second option RFC 9106 recommends: 64 MiB, 3 iterations, and 4 lanes. OWASP's minimum is lower (19 MiB, 2 iterations, 1 lane), which fits more than three times the hashes in flight in the same memory, at a cost in resistance to guessing. Whether to change the default, or to document the trade-off, belongs with M28.
+- **The default Argon2id parameters.** `DefaultParams` is the second option RFC 9106 recommends: 64 MiB, 3 iterations, and 4 lanes. OWASP's minimum is lower (19 MiB, 2 iterations, 1 lane), which fits more than three times the hashes in flight in the same memory, at a cost in resistance to guessing. Whether to change the default, or to document the trade-off, is still open. `PasswordLimit` bounds the memory, and the params decide how many hashes fit in it.
 
 ## Implementation steps
 
@@ -598,10 +598,9 @@ Steps 1 to 3 need no new infrastructure, and they bring the checks that can fail
 
 These entries in `docs/ongoing.md` affect the plan:
 
-- **M28, "Nothing bounds how many password hashes run at once".** The parallel hash benchmark and scenario 2 measure it. Its fix gets scenario 2 as a regression test.
+- **M32, "The default password hash bound ignores a container's memory".** Scenario 2 run in a container without a CPU limit shows it. Scenario 2 is also the regression test of the bound that closed M28.
 - **L55, "The key manager benchmarks time its construction".** Step 1 resolves it and removes the entry.
 - **L56, "Key lookups contend on the key manager's read lock".** The parallel key manager benchmark measures it. Today it is under 1% of a session check.
-- **L30, "PasswordHasher takes no context".** A bound on hashes that waits within the request's deadline needs a context.
 - **L23, "`UpdateAge` has no default, and a large value writes on every request".** The session check benchmark with `UpdateAge` set measures the write.
 - **L27, "After-commit callbacks run synchronously".** The sign-up benchmark with a slow `data.user.created` handler measures the delay.
 - **L29, "The logger cannot say whether a level is enabled".** An allocation budget with a logger on the SQL adapter shows its cost.

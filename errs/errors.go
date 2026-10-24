@@ -21,6 +21,10 @@ const (
 	CategoryUnauthorized   Category = "unauthorized" // not authenticated
 	CategoryForbidden      Category = "forbidden"    // authenticated, not permitted
 	CategoryRateLimited    Category = "rate_limited"
+	// CategoryUnavailable is an operation the system has no room for at the
+	// moment, such as a password hash while the hasher is at its bound. A
+	// later attempt may succeed. Over HTTP it is a 503.
+	CategoryUnavailable Category = "unavailable"
 	// CategoryUnsupportedMedia is a request whose body is of a type the
 	// operation does not accept. Over HTTP it is a 415.
 	CategoryUnsupportedMedia Category = "unsupported_media_type"
@@ -129,6 +133,28 @@ func NewRateLimited(op, ruleName string, retryAfter time.Duration) *DomainError 
 		Code:            "rate_limited",
 		PublicMessage:   "too many requests, please try again later",
 		InternalMessage: fmt.Sprintf("rule %q exceeded", ruleName),
+		Retryable:       true,
+		RetryAfter:      retryAfter,
+	}
+}
+
+// CodeServerBusy is the code of an unavailable error for an operation
+// refused because the server is at capacity, such as a password hash that
+// waited too long for its turn.
+const CodeServerBusy = "server_busy"
+
+// NewUnavailable reports that the system can't take the operation now and
+// that a later attempt may succeed. message is sent to the client.
+// retryAfter, when positive, is how long the client should wait before it
+// tries again. It maps to 503. An unavailable error is not a rejection (see
+// [Category.IsRejection]): the request was not at fault.
+func NewUnavailable(op, code, message string, retryAfter time.Duration) *DomainError {
+	return &DomainError{
+		Category:        CategoryUnavailable,
+		Op:              op,
+		Code:            code,
+		PublicMessage:   message,
+		InternalMessage: fmt.Sprintf("%s: %s", op, message),
 		Retryable:       true,
 		RetryAfter:      retryAfter,
 	}

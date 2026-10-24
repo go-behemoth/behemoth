@@ -65,6 +65,8 @@ A refused request is not an error of the system. Each signal applies that the sa
 
 `telemetry.IsSystemFailure(err)` is the test the span uses. The router uses the mapped status (5xx) for its log level, which gives the same split for errors that reach it.
 
+A refusal for lack of capacity, an error of category `unavailable` such as a busy password hasher, is neither. The router answers it with `503` and logs it at Warn as `request refused: no capacity`, and its span is not failed. The process works as it is set up to, and a burst of these at Error would bury real failures. `behemoth.password.busy` counts the hasher's refusals.
+
 ## How the signals are tied together
 
 | Identifier | Carried by | Set by |

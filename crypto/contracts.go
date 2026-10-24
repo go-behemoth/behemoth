@@ -68,11 +68,20 @@ type KeyManager interface {
 	RemoveVersion(version int) error
 }
 
+// PasswordHasher hashes passwords and checks them against stored hashes.
+// Services.Passwords is one: New builds an [Argon2idHasher].
 type PasswordHasher interface {
-	Hash(password string) (string, error)
+	// Hash returns a hash of password that Verify can check later. ctx
+	// carries the trace of the operation, and bounds any wait before the
+	// hash starts. An implementation that bounds its concurrent hashes, as
+	// Argon2idHasher does, returns an error of category
+	// errs.CategoryUnavailable when it can't start one in time.
+	Hash(ctx context.Context, password string) (string, error)
 
-	// Implementations of this method should be constant-time
-	Verify(hash, password string) (bool, error)
+	// Verify reports whether password matches hash, and must compare in
+	// constant time. A mismatch is false with a nil error. ctx is used as
+	// in Hash.
+	Verify(ctx context.Context, hash, password string) (bool, error)
 
 	// NeedsRehash reports whether an existing hash used weaker parameters than
 	// current config. Lets SignIn upgrade a hash after a

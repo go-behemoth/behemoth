@@ -251,9 +251,9 @@ The layers are ordered for these reasons:
 `wrapWithErrorMapping` is the only place a returned error becomes a response, and the place it is logged:
 
 - `RouterConfig.ErrorMapper.Map(err)` returns `(status, body)`. The default, `httpapi.DefaultErrorMapper`, maps a `*DomainError` through its category (`categoryToStatus`) to a status and `{"error": PublicMessage, "code": Code}`. Anything else (a plain error, or a `DomainError` whose category has no status, such as configuration or internal errors) becomes `500 {"error": "internal server error"}`, so raw error text never reaches a client.
-- A `*DomainError` with `RetryAfter > 0` (rate limiting) also sets the `Retry-After` header, in whole seconds.
+- A `*DomainError` with `RetryAfter > 0` (a rate limit, a busy password hasher) also sets the `Retry-After` header, in whole seconds, rounded up.
 - The mapped body is written with `rctx.Response.JSON`, and the wrapper returns `nil`.
-- The error is logged here, once: at Error when the status is 5xx, at Debug otherwise, with the route's method and pattern, the status and the fields of `telemetry.ErrorFields`. Components below the router return their errors without logging them. See `docs/internal/telemetry/logging.md`.
+- The error is logged here, once: at Warn for an error of category `unavailable` (a `503`, such as a busy password hasher), at Error for any other 5xx, and at Debug otherwise, with the route's method and pattern, the status and the fields of `telemetry.ErrorFields`. Components below the router return their errors without logging them. See `docs/internal/telemetry/logging.md`.
 
 `[Convention]` Because the mapper always handles the error, **a route reaching an adapter never returns a mapped error**. An error returned to the adapter therefore means the response itself could not be built (for example, JSON marshalling failed), and every adapter answers it with a bare `500` instead of flushing. Adapters take no error mapper of their own.
 
