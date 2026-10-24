@@ -49,6 +49,7 @@ plugin := emailpassword.New(emailpassword.Options{
 - The rules apply where a password is set: at sign-up and at a password reset. Sign-in does not apply them, so raising `MinPasswordLength` later does not lock out users whose password is shorter.
 - A minimum above the maximum, or a negative limit, is a configuration error from `Boot`.
 - Passwords are hashed with the hasher configured in `BootConfig.Crypto`. The plugin has no hashing option of its own. See [Bound the password hashes that run at once](#bound-the-password-hashes-that-run-at-once).
+- `crypto.Config.Password` sets the Argon2id parameters. A field left at zero takes the value of `crypto.DefaultParams`. A salt or key length under 16 bytes, or a `Memory` under 8 KiB per lane (`Parallelism`), is a configuration error from `Boot`.
 - The sign-up response says `invalid email` or `invalid password`, with the code `email_invalid_input` or `password_invalid_input`. The text of the error your function returns is not sent to the client.
 
 ## Bound the password hashes that run at once
