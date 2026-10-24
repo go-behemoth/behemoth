@@ -49,6 +49,7 @@ var categoryToStatus = map[errs.Category]int{
 	errs.CategoryUnauthorized:     http.StatusUnauthorized,
 	errs.CategoryForbidden:        http.StatusForbidden,
 	errs.CategoryRateLimited:      http.StatusTooManyRequests,
+	errs.CategoryUnavailable:      http.StatusServiceUnavailable,
 	errs.CategoryUnsupportedMedia: http.StatusUnsupportedMediaType,
 	errs.CategorySession:          http.StatusUnauthorized,
 	errs.CategoryToken:            http.StatusUnauthorized,

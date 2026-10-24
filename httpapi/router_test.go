@@ -270,7 +270,8 @@ func TestRouterRequestID(t *testing.T) {
 }
 
 // A 5xx is the server's failure and is logged at Error with the error's
-// taxonomy fields; a rejection is logged at Debug only.
+// taxonomy fields; a rejection is logged at Debug only. A refusal for lack
+// of capacity is a 503 logged at Warn, with a Retry-After header.
 func TestRouterLogsFailures(t *testing.T) {
 	tel, rec := telemetrytest.New()
 	r := NewRouter(RouterConfig{}, &core.AuthContext{Telemetry: tel})
@@ -284,6 +285,9 @@ func TestRouterLogsFailures(t *testing.T) {
 		{Method: http.MethodGet, Path: "/ok", Handler: func(rctx *RequestContext) error {
 			return rctx.Response.JSON(http.StatusOK, map[string]string{})
 		}},
+		{Method: http.MethodGet, Path: "/busy", Handler: func(*RequestContext) error {
+			return errs.NewUnavailable("crypto.Hash", errs.CodeServerBusy, "server busy", 1500*time.Millisecond)
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +300,10 @@ func TestRouterLogsFailures(t *testing.T) {
 	w := d.serve(t, http.MethodGet, "/api/auth/users/{id}")
 	d.serve(t, http.MethodGet, "/api/auth/missing")
 	d.serve(t, http.MethodGet, "/api/auth/ok")
+	busy := d.serve(t, http.MethodGet, "/api/auth/busy")
+	if busy.Code != http.StatusServiceUnavailable || busy.Header().Get("Retry-After") != "2" {
+		t.Errorf("/busy = %d, Retry-After %q; want 503, \"2\"", busy.Code, busy.Header().Get("Retry-After"))
+	}
 
 	errorLines := rec.Logger.At(slog.LevelError)
 	if len(errorLines) != 1 {
@@ -328,6 +336,11 @@ func TestRouterLogsFailures(t *testing.T) {
 	debugLines := rec.Logger.At(slog.LevelDebug)
 	if len(debugLines) != 1 || debugLines[0].Fields[telemetry.FieldStatus] != http.StatusNotFound {
 		t.Errorf("debug lines = %v, want exactly the 404", debugLines)
+	}
+
+	warnLines := rec.Logger.At(slog.LevelWarn)
+	if len(warnLines) != 1 || warnLines[0].Fields[telemetry.FieldErrorCode] != errs.CodeServerBusy {
+		t.Errorf("warn lines = %v, want exactly the 503", warnLines)
 	}
 }
 

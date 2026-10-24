@@ -18,6 +18,10 @@ type Config struct {
 
 	// Password tunes Argon2id password hashing. nil = DefaultParams.
 	Password *Params
+
+	// PasswordLimit bounds the password hashes that run at once. The zero
+	// value means the defaults described on [PasswordLimit].
+	PasswordLimit PasswordLimit
 }
 
 // New builds every cryptographic component from cfg, all sharing one
@@ -27,6 +31,11 @@ func New(ctx context.Context, cfg Config, tel *telemetry.Telemetry) (Services, e
 	if cfg.Secrets == nil {
 		return Services{}, errs.NewConfigurationError("crypto.New", "a SecretSource is required", nil)
 	}
+	// Checked before the key manager starts its watch, which would outlive
+	// a failed New until ctx ends.
+	if _, err := cfg.PasswordLimit.withDefaults(); err != nil {
+		return Services{}, err
+	}
 	tel = telemetry.OrDefault(tel)
 
 	km, err := NewDefaultKeyManager(ctx, cfg.KeyManager, cfg.Secrets, tel)
@@ -34,12 +43,16 @@ func New(ctx context.Context, cfg Config, tel *telemetry.Telemetry) (Services, e
 		return Services{}, err
 	}
 	rnd := NewRandomizer()
+	passwords, err := NewArgon2idHasher(cfg.Password, cfg.PasswordLimit, km, tel)
+	if err != nil {
+		return Services{}, err
+	}
 
 	return Services{
 		Keys:       km,
 		Random:     rnd,
 		Secrets:    NewSecretHasher(km),
-		Passwords:  NewArgon2idHasher(cfg.Password, km),
+		Passwords:  passwords,
 		CookieSign: NewSigner(km, KeyPurposeCookieSign),
 		JWTSign:    NewSigner(km, KeyPurposeJWTSign),
 		AtRest:     NewEncryptor(km, rnd),

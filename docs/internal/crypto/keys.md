@@ -1,6 +1,6 @@
 # Keys, hashing, signing, and encryption at rest
 
-Every symmetric key Behemoth uses comes from one master secret per version, through the key manager. This document covers the key manager, the services built on it (the secret hasher, the HMAC signers, and the encryptor), the randomizer, and how a rotation reaches them through a watched secret source. Password hashing takes its pepper from the same key manager (`crypto/password_hasher.go`), and the external JWT keys are derived from it as [ADR-0002](../decisions/0002-deriving-external-jwt-keys.md) describes. Key sets of other issuers are in [`key_sets.md`](key_sets.md).
+Every symmetric key Behemoth uses comes from one master secret per version, through the key manager. This document covers the key manager, the services built on it (the secret hasher, the HMAC signers, and the encryptor), the randomizer, and how a rotation reaches them through a watched secret source. Password hashing takes its pepper from the same key manager; [`passwords.md`](passwords.md) covers the hasher and its bound on hashes in flight. The external JWT keys are derived from it as [ADR-0002](../decisions/0002-deriving-external-jwt-keys.md) describes. Key sets of other issuers are in [`key_sets.md`](key_sets.md).
 
 ## Where it sits
 
@@ -10,6 +10,7 @@ Every symmetric key Behemoth uses comes from one master secret per version, thro
 | `DefaultKeyManager`, `NewDefaultKeyManager` | `crypto/key_manager.go` | holds the master secrets by version, and derives a key per purpose and version |
 | `StaticSecretSource` | `crypto/secret_source.go` | a fixed set of secrets, without rotation |
 | `PollingWatcher` | `crypto/polling_watcher.go` | makes any source watchable by loading it every interval |
+| `Argon2idHasher` | `crypto/password_hasher.go` | password hashes, peppered with the `password_hash` key; see [`passwords.md`](passwords.md) |
 | `NewSecretHasher` | `crypto/secret_hasher.go` | the hash of a token, a session token, a one-time code, or a recovery code |
 | `HMACSigner` | `crypto/signer.go` | signs internal JWTs (`jwt_sign`). `Services.CookieSign` (`cookie_sign`) is built, and no flow uses it yet |
 | `AESGCMEncryptor` | `crypto/encryptor.go` | seals OAuth tokens, the OAuth code verifier, and two-factor secrets, through `store.Seal`, each bound to what it is and what it belongs to |

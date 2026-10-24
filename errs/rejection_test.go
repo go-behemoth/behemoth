@@ -19,7 +19,7 @@ func TestIsRejection(t *testing.T) {
 	for _, category := range []Category{
 		CategoryValidation, CategoryNotFound, CategoryUndefinedTable, CategoryDuplicateKey,
 		CategoryForeignKey, CategoryConflict, CategoryUnauthorized, CategoryForbidden,
-		CategoryRateLimited, CategorySession, CategoryToken, CategoryTransaction,
+		CategoryRateLimited, CategoryUnavailable, CategorySession, CategoryToken, CategoryTransaction,
 		CategoryDatabase, CategoryMigration, CategoryInvalidKey, CategoryKeyNotFound,
 		CategoryNotImplemented, CategoryConfiguration, CategorySecurity, CategoryInternal,
 	} {

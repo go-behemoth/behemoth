@@ -72,7 +72,7 @@ Metrics differ from the plan in these ways:
 Tracing differs from the plan in these ways:
 
 - The tracer is set with the option `telemetry.WithTracer`, not as a fourth argument of `New`.
-- The password spans are started in the email/password plugin, not in `crypto`: `PasswordHasher` takes no context, so the hasher cannot start a span with a parent.
+- The password spans were first started in the email/password plugin, not in `crypto`: `PasswordHasher` took no context, so the hasher could not start a span with a parent. Since 2026-10-24 its methods take a context and the hasher starts the spans, as planned.
 - A hook point without handlers gets no chain span.
 - A rejection (not found, an expired session, a hook's veto) does not fail its span. It sets `error_code` and `error_category` only.
 - The adapter has no log exporter. `WithTraceIDs` adds the trace and span IDs to the lines of any logger.

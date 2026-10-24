@@ -12,7 +12,7 @@ The code lives in:
 - `dispatch/dispatcher.go`: `DefaultDispatcher.chainSpan`, `handlerSpan`
 - `ratelimit/limiter.go`: the span in `DefaultRateLimiter.evaluate`
 - `auth/session.go`, `auth/token.go`: the span wrappers around `Create`, `Get`, `Revoke`, `Issue`, `Consume`
-- `plugins/emailpassword`: `hashPassword`, the verify span in `signInBody`
+- `crypto/password_hasher.go`: the spans of `Argon2idHasher.Hash` and `Verify`
 - `migration/runner.go`: `applyTraced`
 - `telemetry/adapters/otel/`: the OpenTelemetry backend, in its own module
 - `telemetry/telemetrytest`: the recording tracer
@@ -55,7 +55,7 @@ The tracer is the one sink set by an option, `telemetry.WithTracer(t)`, and not 
 | a failure of the system (`IsSystemFailure`) | `error_code`, `error_category`, and `RecordError` |
 | a rejection: not found, expired session, a hook's veto, a rate limit | `error_code` and `error_category` only |
 
-`IsSystemFailure` is true for an error outside the taxonomy and for the categories `database`, `transaction`, `undefined_table`, `internal`, `configuration`, `security`, `not_implemented`, and `migration`.
+`IsSystemFailure` is true for an error outside the taxonomy and for the categories `database`, `transaction`, `undefined_table`, `internal`, `configuration`, `security`, `not_implemented`, and `migration`. It is false for `unavailable`: a busy password hasher refused work it had no room for, as it is set up to.
 
 A sign-up looks the email address up and expects to find nothing. If that lookup failed its span, every sign-up trace would show an error. A trace view that highlights failed spans should light up for an outage and stay quiet for a wrong password.
 
@@ -69,7 +69,7 @@ A sign-up looks the email address up and expects to find nothing. If that lookup
 | `behemoth.store.<op>` | `entity` | `instrumentedDB.run` |
 | `behemoth.session.create`, `.validate`, `.revoke` | | the session manager |
 | `behemoth.token.issue`, `.consume` | `kind` | the token manager |
-| `behemoth.password.hash`, `.verify` | | the email/password plugin |
+| `behemoth.password.hash`, `.verify` | | `Argon2idHasher.Hash` and `.Verify`; the span includes the wait for room under `PasswordLimit` |
 | `behemoth.ratelimit.check` | `rule`, `result` | `DefaultRateLimiter.evaluate` |
 | `behemoth.migration.apply` | `id`, `baseline` | `DefaultMigrationRunner.applyTraced` |
 | `behemoth.outbound.request` | `method`, `host`, `status` | `outbound.roundTripper.RoundTrip`; ends when the answer's body is closed. See [`../http/outbound.md`](../http/outbound.md). |
@@ -125,9 +125,11 @@ Because the adapter is called with the span's context, a driver's own instrument
 
 ### Passwords
 
-`crypto.PasswordHasher.Hash` and `Verify` take no context, so the hasher cannot start a span that has a parent. The email/password plugin starts the spans around its calls: `hashPassword` for the four `Hash` calls, and inline for `Verify`. The plan placed these spans in `crypto`.
+`crypto.PasswordHasher.Hash` and `Verify` take a context, and `Argon2idHasher` starts its spans from it, as the plan placed them. Every caller of the hasher is traced under its own span, with no code of its own. `crypto.New` hands the hasher the `Telemetry` that `Boot` gives it.
 
-`[Limit]` Another plugin that hashes a password is not traced unless it does the same. See "PasswordHasher takes no context" in `docs/ongoing.md`.
+A span covers the wait for room under the hasher's bound as well as the hash. `behemoth.password.wait` gives the wait on its own. A refusal with `server_busy` sets `error_code` and `error_category` on the span and does not fail it. See [`../crypto/passwords.md`](../crypto/passwords.md).
+
+Until the context was added, the email/password plugin started these spans around its calls, and another plugin that hashed a password was not traced.
 
 ## The OpenTelemetry adapter
 

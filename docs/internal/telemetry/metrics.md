@@ -73,6 +73,8 @@ Names and attribute keys are constants in `telemetry/metrics.go` (`MetricSignIn`
 | `behemoth.store.duration` | histogram | `op`, `entity` | `instrumentedDB` |
 | `behemoth.store.errors` | counter | `op`, `entity`, `error_category` | `instrumentedDB` |
 | `behemoth.audit.record_failures` | counter | `type` | `Telemetry.AuditFailed` |
+| `behemoth.password.wait` | histogram | | `Argon2idHasher.acquire`, per hash or verify; zero when there was room at once |
+| `behemoth.password.busy` | counter | | `Argon2idHasher.acquire`, per call refused with `server_busy`; see [`../crypto/passwords.md`](../crypto/passwords.md) |
 
 ## Where each measurement is taken
 

@@ -21,7 +21,7 @@ Each component takes a named logger once, at construction, so its lines carry a 
 | Component | `component` | Named by | Lines |
 | --- | --- | --- | --- |
 | `Boot` | `boot` | `logBootSummary` | the boot summary, configuration warnings |
-| `Router` | `router` | `NewRouter`, from `AuthContext.Telemetry` | request failed (Error), request rejected (Debug) |
+| `Router` | `router` | `NewRouter`, from `AuthContext.Telemetry` | request failed (Error), request refused: no capacity (Warn), request rejected (Debug) |
 | `DefaultDispatcher`, `dataHooks` | `hooks` | `NewDefaultDispatcher` | handler errors and panics, failed audit writes, undispatchable after-commit points |
 | `Store` | `store` | `runCommitted`, on use | after-commit callback panicked (Error) |
 | `DefaultRateLimiter` | `ratelimit` | `Boot` | store unavailable (Warn) |
@@ -49,14 +49,19 @@ fields := telemetry.ErrorFields(err, behemoth.M{
 	telemetry.FieldRoute:  route.Path,
 	telemetry.FieldStatus: status,
 })
-if status >= 500 {
+switch {
+case errs.IsCategory(err, errs.CategoryUnavailable):
+	r.log.Warn(rctx.Ctx, "request refused: no capacity", fields)
+case status >= 500:
+	telemetry.SpanFrom(rctx.Ctx).RecordError(err)
 	r.log.Error(rctx.Ctx, "request failed", fields)
-} else {
+default:
 	r.log.Debug(rctx.Ctx, "request rejected", fields)
 }
 ```
 
 - **Level by status.** A 5xx means behemoth failed at something it owed and is logged at Error. Any other status is a rejection of the request (a wrong password, a rate limit, a missing row) and is logged at Debug. A rejection is not an error of the system; phase 3 records it as an audit event and phase 4 counts it.
+- **A refusal for lack of capacity is a Warn.** An error of category `unavailable`, such as a busy password hasher, is a `503`, but the process refused work it had no room for, as it is set up to. Under a burst there is one per refused request, and at Error they would bury real failures.
 - **`route` is the pattern.** `route.Path` is the mounted path with its `{name}` parameters, not the request's path. It has a bounded set of values and holds no identifier.
 - **`error` is the internal message.** The response gets `PublicMessage` from the mapper; the log gets `err.Error()`. The two never mix.
 - **The request ID** is added by the guarded logger from `rctx.Ctx`, and it is the same value the response header carries, so a client's report can be matched to the line.
@@ -67,7 +72,7 @@ if status >= 500 {
 
 ## The email/password plugin
 
-The flows (`signUpBody`, `signInBody`) return their errors and log nothing. So do the three handlers: `handleSignIn` and `handleSignOut` return every error to the router, and `handleSignUp` returns the typed ones. A failed sign-in or sign-out is therefore logged once, by the router, as `request failed` at Error when the status is 5xx and as `request rejected` at Debug otherwise.
+The flows (`signUpBody`, `signInBody`) return their errors and log nothing. So do the three handlers: `handleSignIn` and `handleSignOut` return every error to the router, and `handleSignUp` returns the typed ones. A failed sign-in or sign-out is therefore logged once, by the router: as `request refused: no capacity` at Warn when the password hasher was busy, as `request failed` at Error for another 5xx, and as `request rejected` at Debug otherwise.
 
 The plugin still takes a logger in `Init` (`p.log`) and writes nothing to it at present. `handleSignUp` answers sign-up's untyped refusals itself with a `400`; those are rejections, so nothing is lost by not logging them.
 

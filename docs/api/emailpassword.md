@@ -48,8 +48,40 @@ plugin := emailpassword.New(emailpassword.Options{
 
 - The rules apply where a password is set: at sign-up and at a password reset. Sign-in does not apply them, so raising `MinPasswordLength` later does not lock out users whose password is shorter.
 - A minimum above the maximum, or a negative limit, is a configuration error from `Boot`.
-- Passwords are hashed with the hasher configured in `BootConfig.Crypto`. The plugin has no hashing option of its own.
+- Passwords are hashed with the hasher configured in `BootConfig.Crypto`. The plugin has no hashing option of its own. See [Bound the password hashes that run at once](#bound-the-password-hashes-that-run-at-once).
 - The sign-up response says `invalid email` or `invalid password`, with the code `email_invalid_input` or `password_invalid_input`. The text of the error your function returns is not sent to the client.
+
+## Bound the password hashes that run at once
+
+Sign-up, sign-in, and the password reset each hash a password. A sign-in for an unknown email hashes one too, so that its answer takes as long as a wrong password's. A hash with `crypto.DefaultParams` holds 64 MiB of memory while it runs. `crypto.Config.PasswordLimit` bounds how many hashes run at once in the process, so a burst of requests waits for the hasher instead of exhausting the process's memory:
+
+```go
+ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
+	Crypto: crypto.Config{
+		Secrets: SECRET_SOURCE,
+		PasswordLimit: crypto.PasswordLimit{
+			MaxConcurrent: 4,               // zero means GOMAXPROCS
+			MaxWait:       2 * time.Second, // zero means two seconds
+		},
+	},
+	// ...
+})
+```
+
+`SECRET_SOURCE` is your `crypto.SecretSource`, such as a `crypto.StaticSecretSource`.
+
+The bound works as follows:
+
+- A request over the bound waits for a running hash to finish. A request that waits longer than `MaxWait` gets `503` with `{"error": "the server is busy, please try again later", "code": "server_busy"}` and a `Retry-After` header of `MaxWait`, rounded up to whole seconds. Called from code, a flow returns an `*errs.DomainError` of category `errs.CategoryUnavailable` with the code `errs.CodeServerBusy`.
+- A request whose context ends while it waits gets the context's error. A hash that has started runs to the end.
+- A refusal is not a failed sign-in. No failed point fires, so a lockout built on `auth.signIn.failed` does not count it. Sign-in answers `503` for an unknown email as for a known one, so the answer does not show which addresses have an account.
+- The memory the running hashes hold stays within `MaxConcurrent` times `Params.Memory`. With Go's default garbage collector settings, the process holds up to about twice that for hashing. Checking a password that was stored with more memory than `Params.Memory` counts for more than one hash.
+- More hashes at once add memory and waiting time, and few hashes a second once every CPU is busy.
+- The bound holds per process. Each replica of a deployment has its own, so more replicas take more sign-ins at once.
+- In a container, `GOMAXPROCS` follows the container's CPU limit. A container without a CPU limit sees every CPU of its host, and the default bound can then need more memory than the container has. Set `MaxConcurrent` from the container's memory limit in that case. For example, with `DefaultParams` and 1 GiB, a bound of 4 holds about 512 MiB (4 × 64 MiB × 2).
+- A negative field is a configuration error from `Boot`.
+
+`behemoth.password.wait` and `behemoth.password.busy` show how long requests wait and how many are refused. See [Telemetry](telemetry.md).
 
 ## Routes
 
@@ -80,6 +112,7 @@ An error response is JSON with an `error` message and, for most errors, a `code`
 | `POST /sign-out` | the token belongs to no session, or its session is revoked or expired | `401` | the message and code of the reason: `session_invalid`, `session_revoked`, `session_expired`. With a cookie delivery the response also removes the cookie. See [Sessions](sessions.md#protect-your-own-routes). |
 | any | a hook handler rejected the request with a typed error | the error's status | the error's public message and code |
 | any | too many requests. Sign-in and sign-up each allow 10 attempts a minute per client address (`engine.RuleSignInAddress`, `engine.RuleSignUpAddress`) | `429` with a `Retry-After` header: the seconds left until the limit resets | `{"error": "too many requests, please try again later", "code": "rate_limited"}` |
+| `POST /sign-up/email`, `POST /sign-in/email` | too many passwords are being hashed at once; see [Bound the password hashes that run at once](#bound-the-password-hashes-that-run-at-once) | `503` with a `Retry-After` header | `{"error": "the server is busy, please try again later", "code": "server_busy"}` |
 | any | Behemoth failed (the database is down, for example) | `500` | a generic message; the error's own text is logged, not sent |
 
 Sign-in gives the same answer for an unknown email and a wrong password, so the response does not show which addresses have an account. Sign-up does show it: a `409` says the address is registered. Two sign-ups for the same new address at the same moment get one account, and the other gets the same `409` with `email_taken`.
@@ -288,6 +321,7 @@ With reset on, a missing mail sender, a `LinkURL` that is not an absolute URL, a
 | confirm | `token` or `password` is missing | `400` | `token_invalid_input`, `password_invalid_input` |
 | confirm | the password fails the plugin's rules | `400` | `password_invalid_input`. The link stays usable. |
 | confirm | the link is unknown, expired, already used, or replaced by a newer one | `401` | `invalid_reset_token` |
+| confirm | too many passwords are being hashed at once. The link stays usable. | `503` with `Retry-After` | `server_busy` |
 
 The request route gives one answer for an unknown email, a known one, and a send that failed, so the response does not show which addresses have an account. Confirm gives one answer for every link it refuses.
 

@@ -270,6 +270,51 @@ func TestEmailPasswordSignInAndSignOutErrors(t *testing.T) {
 	}
 }
 
+// busyHasher refuses every hash, as a hasher at its bound does once its
+// wait runs out.
+type busyHasher struct{ crypto.PasswordHasher }
+
+func errServerBusy() error {
+	return errs.NewUnavailable("test", errs.CodeServerBusy, "the server is busy, please try again later", 2*time.Second)
+}
+
+func (busyHasher) Hash(context.Context, string) (string, error) { return "", errServerBusy() }
+func (busyHasher) Verify(context.Context, string, string) (bool, error) {
+	return false, errServerBusy()
+}
+
+// A busy hasher answers every sign-in with the same 503, whether the email
+// has an account or not: the hash that keeps an unknown email's answer as
+// slow as a wrong password's returns the hasher's error, as Verify does.
+// Sign-up answers 503 for a taken email as for a free one. No failed point
+// fires, so a lockout built on them does not count the refusals.
+func TestEmailPasswordAnswersBusyTheSameForEveryEmail(t *testing.T) {
+	ctx := context.Background()
+	tel, rec := telemetrytest.New()
+	ac, routes := auditApp(t, tel, nil)
+	require.Equal(t, http.StatusCreated,
+		call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`).Code)
+	require.NoError(t, ac.Store.CreateUser(ctx, &models.User{Email: "grace@example.com"}))
+	ac.Crypto.Passwords = busyHasher{ac.Crypto.Passwords}
+
+	known := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	assert.Equal(t, http.StatusServiceUnavailable, known.Code)
+	assert.JSONEq(t, `{"error":"the server is busy, please try again later","code":"server_busy"}`, known.Body.String())
+	for name, tc := range map[string]struct{ path, body string }{
+		"sign-in, unknown email":         {"/sign-in/email", `{"email":"nobody@example.com","password":"correct horse"}`},
+		"sign-in, no credential account": {"/sign-in/email", `{"email":"grace@example.com","password":"correct horse"}`},
+		"sign-up, taken email":           {"/sign-up/email", `{"email":"ada@example.com","password":"correct horse"}`},
+		"sign-up, free email":            {"/sign-up/email", `{"email":"new@example.com","password":"correct horse"}`},
+	} {
+		w := call(t, ac, routes[tc.path], tc.body)
+		assert.Equal(t, known.Code, w.Code, name)
+		assert.JSONEq(t, known.Body.String(), w.Body.String(), name)
+	}
+
+	assert.Empty(t, rec.Audit.OfType(string(hooks.HookSignInFailed)))
+	assert.Empty(t, rec.Audit.OfType(string(hooks.HookSignUpFailed)))
+}
+
 func TestEmailPasswordPluginMetadata(t *testing.T) {
 	p := emailpassword.New(emailpassword.Options{})
 	assert.Equal(t, emailpassword.PluginName, p.Meta().Name)

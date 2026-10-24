@@ -37,6 +37,14 @@ The wrapped flows are reached through two exported methods, `Plugin.SignUp(ctx, 
 
 Before entering the wrapped flow, both put the email they were called with in `Values` under `hooks.HookValueEmail`, in its stored form (`publishEmail`, which uses `store.NormalizeEmail`). A rate-limit rule on `auth.signUp.before` or `auth.signIn.before` keys on it, since a rule's `KeyFunc` does not get the payload. A call without an email leaves no entry, and `publishEmail` removes one copied from an enclosing operation, so a rule per email does not apply to that call.
 
+### The password hashes
+
+Every hash goes through `AuthContext.Crypto.Passwords` with the operation's context: `hashPassword` for `Hash`, and `signInBody` for `Verify`. The hasher traces each call and bounds how many hashes run at once, so it can refuse one with `server_busy`; see [`../crypto/passwords.md`](../crypto/passwords.md).
+
+Where sign-in refuses before it has checked a password, for an unknown email or a user without a credential account, it hashes the attempted password and throws the hash away (`decoyHash`). Sign-up does the same for a taken email. The hash makes the answer take as long as a wrong password's.
+
+`[Invariant]` The decoy hash's error is returned, as `Verify`'s is. Under load, a busy hasher then answers `503` for every email. If the error were dropped, an unknown email would get `401` while a known one got `503`, and the answer would tell a caller which addresses have an account. `TestEmailPasswordAnswersBusyTheSameForEveryEmail` checks it. A hasher error fires no failed point: the caller is not at fault, and a lockout must not count it.
+
 ### Sign-in's input
 
 `Plugin.SignIn` takes an `EmailAndPasswordCredentials`: `Email`, `Password`, and an `Extra` map. `signInBody` reads the two fields. `Extra` exists for handlers on `auth.signIn.before`.
@@ -206,6 +214,7 @@ What the router does with each error:
 | `errInvalidCredentials` (all three refusals) | `401` | `{"error": "invalid email or password", "code": "invalid_credentials"}` |
 | a hook handler's typed rejection | the status of its category | its public message and code |
 | a rate limit | `429` with `Retry-After` | the rate limit message |
+| a busy password hasher (`errs.CodeServerBusy`), added with `crypto.PasswordLimit` | `503` with `Retry-After` | the busy message |
 | a database error, or any category without a status | `500` | the category's public message, never the error's text |
 | an untyped error (a hook handler's `errors.New`, an unexpected failure) | `500` | `{"error": "internal server error"}` |
 

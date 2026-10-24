@@ -152,7 +152,8 @@ func FinishSpan(span Span, err error) {
 // IsSystemFailure reports whether err means behemoth or something it
 // depends on failed, as opposed to the request being refused. An error
 // outside the taxonomy counts as a failure, like the router's mapping of it
-// to a 500.
+// to a 500. An unavailable error (errs.CategoryUnavailable) does not: the
+// system refused work it had no room for, as it is set up to.
 func IsSystemFailure(err error) bool {
 	if err == nil {
 		return false

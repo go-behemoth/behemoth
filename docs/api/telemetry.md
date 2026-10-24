@@ -77,8 +77,8 @@ Redaction works on field keys. Text inside a log message is not inspected.
 
 | Level | When | Examples |
 | --- | --- | --- |
-| Error | Behemoth failed at something it should have done | a request answered with a 5xx, a hook handler that returned an error or panicked, a rejected secret rotation |
-| Warn | Behemoth continued, with something degraded | a session cache write failed, the rate-limit store is unavailable, a configuration that is probably a mistake |
+| Error | Behemoth failed at something it should have done | a request answered with a 5xx other than a busy server's `503`, a hook handler that returned an error or panicked, a rejected secret rotation |
+| Warn | Behemoth continued, with something degraded | a session cache write failed, the rate-limit store is unavailable, a request refused with `503` because the password hasher was busy, a configuration that is probably a mistake |
 | Info | lifecycle | the boot summary, a secret rotation applied |
 | Debug | per-request detail | a request that was rejected (wrong password, rate limit), SQL statements |
 
@@ -403,6 +403,8 @@ Durations are in seconds. Attribute values come from fixed sets (a route pattern
 | `behemoth.audit.record_failures` | counter | `type` | audit events that could not be stored |
 | `behemoth.mail.sent` | counter | `kind`, `result` | messages handed to your mail sender; see [Mail](mail.md) |
 | `behemoth.sms.sent` | counter | `kind`, `result` | messages handed to your SMS sender; see [SMS](sms.md) |
+| `behemoth.password.wait` | histogram | | how long each password hash or check waited for its turn under `crypto.PasswordLimit`, zero when it did not wait |
+| `behemoth.password.busy` | counter | | password hashes refused with `503` and `server_busy` after waiting `PasswordLimit.MaxWait`; see [Email and password](emailpassword.md#bound-the-password-hashes-that-run-at-once) |
 
 The names and attribute keys are constants in the `telemetry` package (`telemetry.MetricSignIn`, `telemetry.AttrOutcome`).
 
@@ -432,6 +434,7 @@ These queries are a starting point:
 - **A slow hook handler:** `behemoth.hook.duration` by `plugin`. Handlers on data points run inside a database transaction, so a slow one also holds locks.
 - **Hook errors:** with `phase="before"` they are refusals, which is how a handler stops an operation. With `phase="after"` or `"failed"` a handler did not do its work.
 - **Rate limiting:** `behemoth.ratelimit.checks` with `result="limited"` by `rule`. `result="error"` means the counter store is down. A hook rule that is `skipped` on every call reads a value its point does not publish.
+- **Password hashing capacity:** a rising `behemoth.password.wait` means sign-ins queue for the hasher, and any `behemoth.password.busy` means some were refused with `503`. Both are per process, so they are a signal to add replicas.
 
 ### Measure your own code
 
@@ -467,7 +470,7 @@ tel := telemetry.New(logger, nil, metrics, telemetry.WithTracer(tracer))
 | `behemoth.store.transaction` | | a transaction, with the operations inside as children |
 | `behemoth.session.create`, `.validate`, `.revoke` | | the session manager |
 | `behemoth.token.issue`, `.consume` | `kind` | the token manager |
-| `behemoth.password.hash`, `.verify` | | password hashing in the email/password plugin |
+| `behemoth.password.hash`, `.verify` | | one password hash or check by the password hasher, including its wait for a turn |
 | `behemoth.ratelimit.check` | `rule`, `result` | one rate-limit rule |
 | `behemoth.migration.apply` | `id`, `baseline` | one applied migration |
 | `behemoth.outbound.request` | `method`, `host`, `status` | one call to another service, until its answer is read; see [Outbound calls](outbound.md) |
@@ -477,7 +480,7 @@ A span of an operation that returned an error also has `error_code`, and `error_
 Things worth knowing:
 
 - **Behemoth joins your trace.** It does not read `traceparent` or any other header. Your HTTP framework's tracing middleware starts the server span, and `behemoth.request` becomes its child. Without such middleware, each request to a Behemoth route is a trace of its own.
-- **Only real failures mark a span as failed.** A database error or a panic does. A wrong password, an expired session, a lookup that finds nothing, or a hook handler that refuses an operation does not. The span carries the `error_code` and stays unfailed.
+- **Only real failures mark a span as failed.** A database error or a panic does. A wrong password, an expired session, a lookup that finds nothing, a hook handler that refuses an operation, or a password hasher too busy to take a hash does not. The span carries the `error_code` and stays unfailed.
 - **Hook points without handlers have no chain span.**
 - **`request_id`** on the request span is the ID in the `X-Request-ID` response header and in the log lines.
 
