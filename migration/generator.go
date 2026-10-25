@@ -553,36 +553,43 @@ func RejectAmbiguousTypes(report *IntrospectionReport) error {
 	return nil
 }
 
+// buildMigrationPlan plans and resolves the next migration. It also returns
+// the IDs of the answers the migration used (ResolvedOperationSet.Consumed),
+// for the caller to pass to consumeAnswers once it has written the files.
 func buildMigrationPlan(
 	ctx context.Context,
 	cfg MigrationConfig,
 	declared Declared,
 	deps GenerateDeps,
 	interactive bool,
-) (*Migration, error) {
+) (*Migration, []string, error) {
 	if err := EnsureMigrationFolder(cfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	previousID, err := LatestMigrationID(cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	report, err := buildReport(ctx, cfg, declared.Schemas, deps)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	plan, issues, err := BuildPlan(report, declared.Schemas)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if plan.Custom, err = pendingCustomMigrations(cfg, declared.Custom); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resolved, err := ResolveIssues(ctx, plan, issues, deps.Presenter, interactive)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return deps.Generator.Generate(resolved, previousID)
+	m, err := deps.Generator.Generate(resolved, previousID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, resolved.Consumed, nil
 }
 
 // RunGenerate is the full generate-time call chain:
@@ -596,12 +603,15 @@ func RunGenerate(
 	interactive bool,
 ) (*Migration, error) {
 
-	m, err := buildMigrationPlan(ctx, cfg, declared, deps, interactive)
+	m, consumed, err := buildMigrationPlan(ctx, cfg, declared, deps, interactive)
 	if err != nil {
 		return nil, err
 	}
 
 	if err := writeMigrationFile(cfg, *m); err != nil {
+		return nil, err
+	}
+	if _, err := consumeAnswers(ctx, deps.Presenter, consumed, *m); err != nil {
 		return nil, err
 	}
 	return m, nil
