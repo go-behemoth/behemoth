@@ -224,5 +224,6 @@ A run that writes a migration removes from the draft the answers it used, those 
 These parts are deferred:
 
 - **`--previous <id>` and `behemoth schema snapshot`,** which the design document names for `PathGenerateOnly`.
+- **Script formats for golang-migrate and goose,** so that an application that applies its migrations with one of them takes the files as they are. Planned in [`../plans/migration_tool_formats.md`](../plans/migration_tool_formats.md).
 - **Constructors for SQLite and SQL Server.** Each is the five lines of `postgres.MigrationBackend` or `mysql.MigrationBackend`. Until then an application on one of them fills `migration.Backend` itself.
 - **The audit event of an applied migration.** `migrate` sets no audit recorder, so none is written. The audit table may be created by the very migration being applied.
