@@ -4,6 +4,8 @@
 //   - MySQLAdapter implements behemoth.Database (application reads/writes).
 //   - MySQLDriver implements the migration interfaces: migration.SchemaDriver,
 //     migration.MigrationRenderer, migration.SchemaIntrospector and migration.ColumnNormalizer.
+//   - MigrationBackend returns both as one migration.Backend, for
+//     migration.Generate, migration.Migrate and the behemoth command line.
 //
 // Both take the same behemoth.SchemaResolver, so application queries and
 // migrations agree on physical table and column names.
