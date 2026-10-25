@@ -1,0 +1,62 @@
+# Runs the cli example with PostgreSQL:
+#
+#   docker compose up --build   # the database, the migration, then the server on :8080
+#   docker compose down         # stop; add -v to drop the database and the migrations
+#
+# migrate is a job: it writes the next migration, applies it with psql, and
+# exits. The server starts once it has succeeded. Set BEHEMOTH_SECRET (hex,
+# 32 bytes or more) in the environment or in a .env file next to this one
+# to keep sessions across restarts; without it the server uses a random one.
+name: behemoth-cli
+
+x-database-url: &database-url postgres://postgres:postgres@db:5432/behemoth?sslmode=disable
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: behemoth
+    volumes:
+      # PostgreSQL 18 images keep their data under a directory per major
+      # version below this path.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: during its first start the image runs a temporary server
+      # on the socket only, which a socket check would take for the real one.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "behemoth"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: examples/cli/Dockerfile
+      target: migrate
+    environment:
+      DATABASE_URL: *database-url
+    volumes:
+      - migrations:/app/migrations
+    depends_on:
+      db:
+        condition: service_healthy
+
+  server:
+    build:
+      context: ../..
+      dockerfile: examples/cli/Dockerfile
+      target: server
+    environment:
+      DATABASE_URL: *database-url
+      BEHEMOTH_SECRET: ${BEHEMOTH_SECRET:-}
+    ports:
+      - "${PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  migrations:
