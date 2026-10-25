@@ -62,7 +62,11 @@ func TestPostgreSQLDriver(t *testing.T) {
 
 	t.Run("MigrationBackend", func(t *testing.T) {
 		require.NoError(t, tm.DropAllTables(ctx))
-		migrationBackendPostgres(t, db)
+		migrationBackend(t, db, postgresDialect)
+	})
+
+	t.Run("Pipeline", func(t *testing.T) {
+		migrationPipeline(t, db, postgresDialect, tm.DropAllTables)
 	})
 }
 
@@ -95,6 +99,19 @@ func TestMySQLDriver(t *testing.T) {
 	t.Run("LedgerReadsBackThroughAdapter", func(t *testing.T) {
 		require.NoError(t, tm.DropAllTables(ctx))
 		readBackThroughAdapter(t, mysql.NewMySQLDriver(db, nil), testutils.SetupMySQLAdapter(db))
+	})
+
+	t.Run("MigrationBackend", func(t *testing.T) {
+		require.NoError(t, tm.DropAllTables(ctx))
+		migrationBackend(t, db, mysqlDialect)
+	})
+
+	t.Run("Pipeline", func(t *testing.T) {
+		migrationPipeline(t, db, mysqlDialect, tm.DropAllTables)
+	})
+
+	t.Run("ScriptWentStale", func(t *testing.T) {
+		mysqlScriptWentStale(t, db, tm.DropAllTables)
 	})
 }
 

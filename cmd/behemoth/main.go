@@ -27,7 +27,7 @@
 // is also how the commands run where there is no Go toolchain.
 //
 // Experimental: the command line is a first version, with a ready-made setup
-// for PostgreSQL only. Its behavior can change between versions.
+// for PostgreSQL and MySQL. Its behavior can change between versions.
 package main
 
 import (
