@@ -9,9 +9,11 @@ behemoth generate -confirm   # write it to your migrations folder
 
 `behemoth migrate` applies it, for applications that let Behemoth apply their migrations.
 
+When a difference has more than one answer, such as a column that becomes shorter, `generate` asks you in your terminal, or takes the answer from `-answer`. See [Questions](#questions).
+
 The command reads your plugins, your schema, and your migration settings from your own code. You don't describe them a second time in a config file.
 
-**Experimental:** the command line is a first version, with a ready-made setup for PostgreSQL only. See [Limits](#limits) for what it does not cover.
+**Experimental:** the command line is a first version, with a ready-made setup for PostgreSQL and MySQL. See [Limits](#limits) for what it does not cover.
 
 ## Setup
 
@@ -53,6 +55,8 @@ func MigrationBackend(ctx context.Context, app *engine.PreparedApp) (migration.B
 	return postgres.MigrationBackend(db, app.Resolver), nil
 }
 ```
+
+On MySQL, return `mysql.MigrationBackend(db, app.Resolver)` instead, from `github.com/go-behemoth/behemoth/storage/adapters/mysql`. For another database, see [Other databases](#other-databases).
 
 Your server calls the same `Prepare` and passes its result to `Boot`:
 
@@ -126,17 +130,81 @@ After you apply a script, run `behemoth generate` again. When the database match
 No schema changes detected.
 ```
 
-### Questions and the draft file
+### Questions
 
-Some differences have more than one answer. If a column becomes shorter in your declaration, Behemoth can alter it, which may reject existing rows, or leave it as it is. The command does not prompt. It writes the question to `draft.json` in your migrations folder with a default answer, "Leave as-is". When the command reads an answer from that file, it tells you:
+Some differences have more than one answer. If a column becomes shorter in your declaration, Behemoth can alter it, which may reject existing rows, or leave it as it is. `generate` asks you:
 
 ```
-No schema changes detected.
+$ behemoth generate
+1 question needs an answer. Each answer is saved to migrations/draft.json as you give it.
 
-1 answer(s) were read from migrations/draft.json. A new question starts with its default answer, which changes nothing. Edit the file and run the command again to choose another.
+Question 1 of 1 (alter_column_users_plan)
+users: Column "plan"'s definition narrows (may reject or truncate existing data): length 32 -> 16.
+
+  1) Apply alter
+  2) Leave as-is (default)
+Answer [2]: 1
+
+Migration 0002 ready (not yet written). Re-run with --confirm to write it to migrations.
+
+0002, 1 operation(s):
+  alter column users.plan
+
+Answers read from migrations/draft.json:
+  alter_column_users_plan: Apply alter
+To change an answer, edit the file and run the command again.
 ```
 
-The file lists each question with its options. `chosen` is the position of the answer in `options`, counted from 0:
+Type the number of an answer, or press Enter for the default. Each answer is saved to `draft.json` in your migrations folder as soon as you give it, so the answers you gave are kept if you stop the command with Ctrl+C. A question that has an answer isn't asked again.
+
+The questions go to stderr and the rest of the output to stdout, so they still show when you redirect the output to a file.
+
+#### Without a terminal
+
+The command asks only when its input is a terminal. In CI, in a script, or in a container started without a TTY, a run with a question that has no answer stops with exit code 1 and lists the question:
+
+```
+behemoth generate: 1 question has no answer:
+
+  alter_column_users_plan
+  users: Column "plan"'s definition narrows (may reject or truncate existing data): length 32 -> 16.
+    "chosen": 0  Apply alter
+    "chosen": 1  Leave as-is (default)
+
+Answer in a terminal, with -answer, such as -answer 'alter_column_users_plan=Leave as-is', or by setting "chosen" in migrations/draft.json (and deleting "stale" where it is set). Then run the command again.
+```
+
+`-no-input` makes the command behave this way in a terminal too, for a script that you run from one:
+
+```bash
+behemoth generate -confirm -no-input
+```
+
+#### Answer on the command line
+
+`-answer` answers a question without a terminal, in a script or in CI. Give the question's id and the label of one of its options, and repeat the flag for each question:
+
+```bash
+behemoth generate -confirm -answer 'alter_column_users_plan=Apply alter'
+```
+
+The answer works like one given at the prompt:
+
+- The label is compared without regard to case.
+- The answer is saved to the draft file, so a later run reads it there. It replaces an answer the file held.
+- In a terminal, the command asks only the questions that the flags leave open.
+
+The command refuses an answer for a question the run doesn't raise, or with a label that isn't one of the question's options, and exits with code 1:
+
+```
+behemoth generate: the answer "Alter" for alter_column_users_plan is not one of its options: "Apply alter", "Leave as-is"
+```
+
+A value without `=`, or an id given twice, is a usage error, with exit code 2.
+
+#### The draft file
+
+The draft file holds each question, its options, and its answer. `chosen` is the position of the answer in `options`, counted from 0. It is `null` until the question is answered. `default` is the answer Behemoth suggests, the one Enter picks:
 
 ```json
 {
@@ -144,15 +212,22 @@ The file lists each question with its options. `chosen` is the position of the a
     {
       "id": "alter_column_users_plan",
       "table": "users",
-      "description": "Column \"plan\"'s definition narrows (may reject or truncate existing data).",
+      "description": "Column \"plan\"'s definition narrows (may reject or truncate existing data): length 32 -> 16.",
       "options": ["Apply alter", "Leave as-is"],
-      "chosen": 1
+      "default": 1,
+      "chosen": null
     }
   ]
 }
 ```
 
-Set `chosen` to `0` and run `behemoth generate` again to get the alter. Read the last lines of the output before you trust "No schema changes detected", because the command prints it even when it read answers from the draft file.
+To answer without a terminal, set `chosen` and run the command again.
+
+If the options of an answered question change, for example because a new candidate for a rename appears, the entry gets `"stale": true` and a note. In a terminal, the question is asked again. In the file, check `chosen` against the new options, then delete `stale`.
+
+Commit the file with your migrations. A "Leave as-is" answer stays in it, and a run without a terminal, such as one in CI, reads it instead of stopping on the question again.
+
+#### An answer is used once
 
 An answer that changes your database, such as "Apply alter", is used once. When `generate -confirm` writes the migration, it removes that answer from the file and says so:
 
@@ -160,7 +235,7 @@ An answer that changes your database, such as "Apply alter", is used once. When 
 Migration 0002 written to migrations/0002_alter_column_users_plan.json, with its script at migrations/0002_alter_column_users_plan.sql. Hand off the script to your own migration tool. The 1 answer(s) it used were removed from the draft, so a later change to the same column is asked again.
 ```
 
-A later change to the same column starts again from "Leave as-is". A "Leave as-is" answer stays in the file, so a column you chose to leave as it is isn't asked about again.
+A later change to the same column is a new question. A "Leave as-is" answer stays in the file, so a column you chose to leave as it is isn't asked about again.
 
 ## `migrate`
 
@@ -238,7 +313,7 @@ To offer the commands from your application's own binary, call `cli.Run` with th
 
 ```go
 if len(os.Args) > 1 && os.Args[1] == "behemoth" {
-	os.Exit(cli.Run(ctx, os.Args[2:], os.Stdout, os.Stderr, auth.Prepare, auth.MigrationBackend))
+	os.Exit(cli.Run(ctx, os.Args[2:], os.Stdin, os.Stdout, os.Stderr, auth.Prepare, auth.MigrationBackend))
 }
 ```
 
@@ -249,14 +324,14 @@ The commands exit with one of these codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | The command ran. It found changes or it found none. |
-| 1 | It failed: `Prepare` returned an error, the database could not be reached, or the migration could not be built. |
-| 2 | Unknown command, unknown flag, or an argument it did not expect. |
+| 1 | It failed: `Prepare` returned an error, the database could not be reached, a question has no answer and nobody could be asked, an `-answer` was refused, or the migration could not be built. |
+| 2 | Unknown command, unknown flag, a malformed `-answer`, or an argument it did not expect. |
 
 The launcher returns the command's own exit code. It returns 1 itself when it cannot find or build your setup.
 
 ## Other databases
 
-`postgres.MigrationBackend` is available for PostgreSQL only. For MySQL, SQLite, or SQL Server, fill `migration.Backend` yourself from the module's driver. `generate` needs `Introspector`, and `Renderer` for the script. `migrate` also needs `Driver` and `DB`: the module's driver and its adapter:
+`postgres.MigrationBackend` and `mysql.MigrationBackend` are ready-made. For SQLite or SQL Server, fill `migration.Backend` yourself from the module's driver. `generate` needs `Introspector`, and `Renderer` for the script. `migrate` also needs `Driver` and `DB`: the module's driver and its adapter:
 
 ```go
 func MigrationBackend(ctx context.Context, app *engine.PreparedApp) (migration.Backend, error) {
@@ -264,12 +339,22 @@ func MigrationBackend(ctx context.Context, app *engine.PreparedApp) (migration.B
 	if err != nil {
 		return migration.Backend{}, err
 	}
-	driver := mysql.NewMySQLDriver(db, app.Resolver)
+	driver := sqlserver.NewSQLServerDriver(db, app.Resolver)
 	return migration.Backend{Introspector: driver, Renderer: driver, Close: db.Close}, nil
 }
 ```
 
 With GORM or Bun, take the `*sql.DB` your ORM holds and build the backend of the database underneath.
+
+### Apply a MySQL script
+
+A MySQL script holds several statements. The `mysql` client runs them all in one call:
+
+```bash
+mysql --host=127.0.0.1 --user=root --password behemoth < migrations/0001_create_accounts_and_8_more.sql
+```
+
+From Go, `github.com/go-sql-driver/mysql` runs a script in one `Exec` only when the DSN has `multiStatements=true`. That setting lets one call run several statements, so leave it off the connection your application's queries use, and set it only on the one that applies migrations.
 
 MongoDB has no migrations. See [MongoDB](./mongodb.md).
 
@@ -286,8 +371,8 @@ res, err := migration.Generate(ctx, app.Migration, app.Declared(), backend, migr
 
 The command line has these limits:
 
-- **No prompt.** The command asks no questions. You answer them in `draft.json`, as described above.
 - **No vendored modules.** The launcher can't build in a vendored module. Use the hand-written program.
 - **Moved files.** Migration numbers come from the files in your migrations folder. If you move a generated `.json` out of it, the next migration gets its number again.
+- **Answers while a migration waits.** On the managed path, while a written migration waits for `migrate`, `generate` plans nothing, so it reads no `-answer`. Run `migrate -confirm` first.
 
 The [examples/cli](../../examples/cli) directory holds a complete application set up this way.

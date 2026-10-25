@@ -7,11 +7,15 @@
 # is applied, so the job runs on every "docker compose up". The database is
 # what generate compares with, so a script from an earlier run is never
 # applied twice.
+#
+# Its arguments go to generate, to answer a question without a terminal:
+#
+#   docker compose run --rm migrate -answer 'alter_column_users_plan=Apply alter'
 set -eu
 
 before=$(ls migrations/*.sql 2>/dev/null || true)
 
-behemoth generate -confirm
+behemoth generate -confirm "$@"
 
 for script in migrations/*.sql; do
 	[ -e "$script" ] || continue

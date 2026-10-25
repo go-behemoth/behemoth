@@ -1,11 +1,14 @@
 package migration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-behemoth/behemoth/errs"
@@ -16,7 +19,8 @@ type draftEntry struct {
 	Table       string   `json:"table"`
 	Description string   `json:"description"`
 	Options     []string `json:"options"`         // labels only — the actual Operations stay in-process, never serialized to the draft, per the "developer picks an option, never hand-authors an operation" boundary
-	Chosen      *int     `json:"chosen"`          // null = pending
+	Default     int      `json:"default"`         // the planner's suggestion, an index into Options; a hint for whoever answers, never read as an answer
+	Chosen      *int     `json:"chosen"`          // null = open: no answer yet
 	Stale       bool     `json:"stale,omitempty"` // set when a recorded decision's options have since changed; the decision is not applied until the developer removes it — see Identity Stability
 	StaleNote   string   `json:"stale_note,omitempty"`
 }
@@ -25,12 +29,34 @@ type draftFile struct {
 	Entries []draftEntry `json:"entries"`
 }
 
+// FilePresenter keeps the questions of a run and their answers in the draft
+// file (DraftPath): JSON that survives between runs and can be reviewed and
+// committed. A developer answers by setting an entry's "chosen", or through
+// a front-end that writes to the same file, such as PromptPresenter.
 type FilePresenter struct {
 	path string
+
+	// Given holds answers decided before the run, such as the command
+	// line's -answer flags: option labels, by question ID. Present writes
+	// each one to the draft as it writes the question. A given answer
+	// replaces an answer the draft held and clears a stale flag. Labels are
+	// compared without regard to case.
+	//
+	// An answer for a question the run does not raise, or with a label that
+	// is not one of its question's options, makes Present return an error
+	// of code errs.CodeMigrationInvalidAnswer, after it has written the
+	// draft. A mistyped answer is refused rather than dropped.
+	Given map[string]string
 }
 
+// NewFilePresenter returns a FilePresenter for the draft file at path.
 func NewFilePresenter(path string) *FilePresenter { return &FilePresenter{path: path} }
 
+// Present implements [ResolutionPresenter]: it writes the run's questions to
+// the draft. An answered question keeps its answer, flagged as stale when its
+// options have changed since. A new question is written open, with the
+// planner's suggestion as "default". A question the run no longer raises is
+// dropped.
 func (p *FilePresenter) Present(ctx context.Context, issues []PlanIssue, priorDecisions map[string]int) error {
 	existing, _ := p.readDraft() // missing file = first run, treated as empty prior state, not an error
 	existingByID := map[string]draftEntry{}
@@ -59,6 +85,7 @@ func (p *FilePresenter) Present(ctx context.Context, issues []PlanIssue, priorDe
 					Table:       issue.Table,
 					Description: issue.Description,
 					Options:     labels,
+					Default:     issue.Default,
 					Chosen:      prior.Chosen,
 				}
 				// Sticky: once flagged, an entry stays stale until the
@@ -73,22 +100,76 @@ func (p *FilePresenter) Present(ctx context.Context, issues []PlanIssue, priorDe
 			}
 		}
 
-		// New issue, or previously pending, with Default pre-selected as a hint.
-		def := issue.Default
+		// New, or still open: written without an answer. The default is a
+		// hint for whoever answers, not an answer: a run with nobody to ask
+		// stops on the question (Collect skips it, ResolveIssues fails
+		// closed), as the design document asks of an unattended run.
 		out.Entries = append(out.Entries,
 			draftEntry{
 				ID:          issue.ID,
 				Table:       issue.Table,
 				Description: issue.Description,
 				Options:     labels,
-				Chosen:      &def,
+				Default:     issue.Default,
 			})
 	}
 
 	// Entries whose ID no longer appears in `issues` are dropped
 	_ = seen
 
-	return p.writeDraft(out)
+	refused := p.applyGiven(out.Entries)
+	if err := p.writeDraft(out); err != nil {
+		return err
+	}
+	if len(refused) > 0 {
+		return errs.NewMigrationError("FilePresenter.Present", errs.CodeMigrationInvalidAnswer, errors.New(strings.Join(refused, "; ")))
+	}
+	return nil
+}
+
+// applyGiven writes the given answers into entries, and returns one line per
+// answer it refused, in the order of their question IDs.
+func (p *FilePresenter) applyGiven(entries []draftEntry) []string {
+	ids := make([]string, 0, len(p.Given))
+	for id := range p.Given {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+
+	var refused []string
+	for _, id := range ids {
+		label := strings.TrimSpace(p.Given[id])
+		i := slices.IndexFunc(entries, func(e draftEntry) bool { return e.ID == id })
+		if i < 0 {
+			raised := make([]string, len(entries))
+			for j, e := range entries {
+				raised[j] = e.ID
+			}
+			if len(raised) == 0 {
+				refused = append(refused, fmt.Sprintf("the answer for %q names a question this run does not raise: it raises none", id))
+			} else {
+				refused = append(refused, fmt.Sprintf("the answer for %q names a question this run does not raise: it raises %s", id, strings.Join(raised, ", ")))
+			}
+			continue
+		}
+		e := &entries[i]
+		option := slices.IndexFunc(e.Options, func(o string) bool { return strings.EqualFold(o, label) })
+		if option < 0 {
+			refused = append(refused, fmt.Sprintf("the answer %q for %s is not one of its options: %s", label, id, quoteAll(e.Options)))
+			continue
+		}
+		e.Chosen = &option
+		e.Stale, e.StaleNote = false, ""
+	}
+	return refused
+}
+
+func quoteAll(labels []string) string {
+	quoted := make([]string, len(labels))
+	for i, l := range labels {
+		quoted[i] = strconv.Quote(l)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func staleNote() string {
@@ -110,6 +191,9 @@ func IsStale(old, new []string) bool {
 	return !slices.Equal(old, new)
 }
 
+// Collect implements [ResolutionPresenter]: it returns the answers in the
+// draft, by question ID. An open question (see [Question.Open]) has none; it
+// is not an error here, ResolveIssues is what fails closed on it.
 func (p *FilePresenter) Collect(ctx context.Context) (map[string]int, error) {
 	draft, err := p.readDraft()
 	if err != nil {
@@ -117,22 +201,67 @@ func (p *FilePresenter) Collect(ctx context.Context) (map[string]int, error) {
 	}
 	decisions := map[string]int{}
 	for _, e := range draft.Entries {
-		if e.Chosen == nil {
-			continue // still pending: not an error here; ResolveIssues (below) is what enforces fail-closed
+		if q := e.question(); !q.Open() {
+			decisions[q.ID] = *q.Chosen
 		}
-		if e.Stale {
-			// Recorded against options that have since changed: the index may
-			// now select a different option. Pending until reviewed.
-			continue
-		}
-		if *e.Chosen < 0 || *e.Chosen >= len(e.Options) {
-			// Manifesto's Input Validation branch: malformed entry treated
-			// as still-pending.
-			continue
-		}
-		decisions[e.ID] = *e.Chosen
 	}
 	return decisions, nil
+}
+
+// Question is a draft entry as a command shows it: a difference planning
+// can't settle alone, its options, and its answer.
+type Question struct {
+	ID          string
+	Table       string
+	Description string
+	Options     []string // the labels, in the order Default and Chosen count
+	Default     int      // the planner's suggestion, an index into Options
+	Chosen      *int     // the answer, an index into Options; nil while there is none
+	Stale       bool     // the answer was given for options that have changed since
+}
+
+// Open reports whether q waits for an answer: it has none, the one it has
+// was given for options that have changed since (it is stale, and the index
+// may now name another option), or it names no option (a hand edit out of
+// range, which the design document's input validation treats as no answer).
+func (q Question) Open() bool {
+	return q.Chosen == nil || q.Stale || *q.Chosen < 0 || *q.Chosen >= len(q.Options)
+}
+
+// Questions returns the questions in the draft, in its order. A missing
+// draft has none.
+func (p *FilePresenter) Questions() ([]Question, error) {
+	draft, err := p.readDraft()
+	if err != nil {
+		return nil, errs.NewMigrationError("FilePresenter.Questions", errs.CodeMigrationDraftReadFailed, err)
+	}
+	questions := make([]Question, len(draft.Entries))
+	for i, e := range draft.Entries {
+		questions[i] = e.question()
+	}
+	return questions, nil
+}
+
+func (e draftEntry) question() Question {
+	return Question{ID: e.ID, Table: e.Table, Description: e.Description, Options: e.Options, Default: e.Default, Chosen: e.Chosen, Stale: e.Stale}
+}
+
+// answer records index as the answer to the question id, clears a stale
+// flag, and writes the draft at once. A front-end saves each answer this way
+// as it is given, so an interrupted session loses none.
+func (p *FilePresenter) answer(id string, index int) error {
+	draft, err := p.readDraft()
+	if err != nil {
+		return err
+	}
+	for i := range draft.Entries {
+		if e := &draft.Entries[i]; e.ID == id {
+			e.Chosen = &index
+			e.Stale, e.StaleNote = false, ""
+			return p.writeDraft(draft)
+		}
+	}
+	return fmt.Errorf("the draft has no question %q", id)
 }
 
 // Consume implements [ResolutionConsumer]: it removes the entries of ids from
@@ -202,11 +331,14 @@ func (p *FilePresenter) readDraft() (draftFile, error) {
 }
 
 func (p *FilePresenter) writeDraft(df draftFile) error {
-	b, err := json.MarshalIndent(df, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // people read the file: "length 32 -> 16" stays as written, not "-\u003e"
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(df); err != nil {
 		return err
 	}
-	return os.WriteFile(p.path, b, 0644)
+	return os.WriteFile(p.path, buf.Bytes(), 0644)
 }
 
 // [Deferred] Format is plain JSON for a working v1 — no comments support,
@@ -216,7 +348,8 @@ func (p *FilePresenter) writeDraft(df draftFile) error {
 // the format choice is finalized — this only touches readDraft/writeDraft.
 
 // ResolveIssues is the Resolution stage's orchestrator: Present, then
-// (for an interactive CLI) pause for edits, then Collect + gate.
+// Collect + gate. A presenter that asks the questions, such as
+// PromptPresenter, does so in Present; interactive is not read.
 func ResolveIssues(
 	ctx context.Context,
 	plan *MigrationPlan,
@@ -227,13 +360,6 @@ func ResolveIssues(
 	prior, _ := presenter.Collect(ctx) // best-effort prior state for merge inside Present
 	if err := presenter.Present(ctx, issues, prior); err != nil {
 		return nil, err
-	}
-
-	if interactive {
-		// [Implementation Detail] actual pause-for-editor-then-continue loop
-		// (e.g. shelling to $EDITOR, or an explicit re-run) lives in the CLI
-		// layer, not here — ResolveIssues assumes Collect below reflects a
-		// completed edit pass.
 	}
 
 	decisions, err := presenter.Collect(ctx)
@@ -256,12 +382,11 @@ func ResolveIssues(
 		}
 	}
 	if len(unresolved) > 0 {
-		// Fail-closed — identical in both interactive and non-interactive
-		// contexts at THIS point; an interactive CLI is expected to have
-		// already looped edit-then-retry before ever calling this in a way
-		// that reaches here with unresolved entries still present.
+		// Fail-closed: an open question has no default answer. A presenter
+		// that could ask has asked in Present; what is still open stops the
+		// run, which is the design document's rule for an unattended one.
 		return nil, errs.NewMigrationError("Resolution.ResolveIssues", errs.CodeMigrationUnresolvedIssues,
-			fmt.Errorf("unresolved: %s", strings.Join(unresolved, ", ")))
+			fmt.Errorf("%d question(s) have no answer: %s", len(unresolved), strings.Join(unresolved, ", ")))
 	}
 	return resolved, nil
 }

@@ -107,7 +107,7 @@ psql "$DATABASE_URL" -f migrations/0001_create_accounts_and_8_more.sql
 go run .                      # Prepare + Boot, then serve HTTP
 ```
 
-[Its README](./examples/cli/README.md) has the full steps: Docker, a schema change, the draft file, and `migrate`. To run it with Docker, without Go or a local database:
+[Its README](./examples/cli/README.md) has the full steps: Docker, a schema change, answering a question, and `migrate`. To run it with Docker, without Go or a local database:
 
 ```bash
 cd examples/cli
@@ -148,7 +148,7 @@ Migrations can be generated for PostgreSQL, MySQL, SQLite and SQL Server. MongoD
 | [Outbound calls](./docs/api/outbound.md) | The client Behemoth calls other services with: its settings, the rules every call follows, and using it in your code |
 | [Hooks](./docs/api/hooks.md) | Hook points, handlers, ordering and failure behavior |
 | [Telemetry](./docs/api/telemetry.md) | Loggers, audit, metrics, tracing and the OpenTelemetry adapter |
-| [Command line](./docs/api/cli.md) | `behemoth generate`: setup, the launcher, the draft file, running it without the launcher |
+| [Command line](./docs/api/cli.md) | `behemoth generate`: setup, the launcher, its questions and the draft file, running it without the launcher |
 | [Core tables](./docs/api/core-tables.md) | Writing Behemoth's tables from a plugin |
 | [Supported databases](./docs/api/supported-databases.md) | The releases of PostgreSQL, MySQL, SQL Server, MongoDB, Redis and SQLite Behemoth supports, and running the tests against another release |
 | [MongoDB](./docs/api/mongodb.md) | What the server needs, and creating the indexes a schema declares |
