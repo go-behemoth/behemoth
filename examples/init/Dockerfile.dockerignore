@@ -7,4 +7,10 @@ tests
 **/migrations
 examples/*
 !examples/init
+# After the line above, which would bring them back: migrations generated
+# locally belong in the volume on /app/migrations, not in the image, go build
+# leaves the binary here, and a .env may hold a secret.
+examples/init/migrations
+examples/init/init
+examples/init/.env
 examples/init/Dockerfile*
