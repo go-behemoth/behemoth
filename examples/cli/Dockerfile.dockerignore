@@ -1,0 +1,17 @@
+# Build context is the repository root; send only what the example needs.
+.git
+.github
+docs
+tests
+**/*.db
+examples/*
+!examples/cli
+# After the line above, which would bring them back: the migrations live in
+# a volume, the binaries go build leaves here are not needed, and a .env may
+# hold a secret.
+examples/cli/migrations
+examples/cli/cli
+examples/cli/behemoth
+examples/cli/Dockerfile*
+examples/cli/compose.yaml
+examples/cli/.env

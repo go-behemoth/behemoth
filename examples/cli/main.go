@@ -15,6 +15,15 @@
 //
 // DATABASE_URL defaults to postgres://postgres:postgres@localhost:5432/behemoth?sslmode=disable
 //
+// With Docker, compose.yaml runs PostgreSQL, the migration and the server,
+// with no Go toolchain or local database:
+//
+//	docker compose up --build   # the server listens on :8080
+//	docker compose down -v      # stop, and drop the database
+//
+// Its migrate job runs this example's own command (cmd/behemoth), built into
+// the image, and applies the script with psql (migrate.sh).
+//
 // The setup is in the auth package. This file and the command line both
 // call auth.Prepare and auth.OpenDB, so the tables the migration creates are
 // the ones the server reads. With the server running:
