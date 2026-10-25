@@ -25,7 +25,7 @@ Behemoth might provide tool-specific generation (for goose or golang-migrate for
 | --- | --- |
 | `schema` | The declaration vocabulary shared across packages: `schema.Table`, `Column`, `Index`, `ForeignKey`, `ColumnOverride`, the `ColumnType` and `FK*` action constants, the contribution types, and `schema.Registry` (`DefaultRegistry`, `NewRegistry`). `[Convention, important]` It must never import `core`: it sits below it so `PluginInitContext` can carry a registry without an import cycle. |
 | `migration` | Everything about migrating: operations, `Migration`, `MigrationConfig`, `CustomMigration`, introspection/diff, planning, resolution, generation, the runner, `BuildSchemaResolverTable`, the driver capability interfaces below, and `Backend` with `Generate` and `Migrate`, which bundle those capabilities and pick the entry point by path (see *Entry points*). |
-| `storage/adapters/postgres`, `storage/adapters/sqlite`, `storage/adapters/mysql`, `storage/adapters/sqlserver` | One module per database, each holding the `behemoth.Database` adapter **and** the migration driver, built with the same `SchemaResolver` so application queries and migrations agree on physical names. SQLite is its own module so only applications using it link `go-sqlite3` (and therefore cgo). The Postgres module also has `MigrationBackend`, which returns both as one `migration.Backend`. |
+| `storage/adapters/postgres`, `storage/adapters/sqlite`, `storage/adapters/mysql`, `storage/adapters/sqlserver` | One module per database, each holding the `behemoth.Database` adapter **and** the migration driver, built with the same `SchemaResolver` so application queries and migrations agree on physical names. SQLite is its own module so only applications using it link `go-sqlite3` (and therefore cgo). The Postgres and MySQL modules also have `MigrationBackend`, which returns both as one `migration.Backend`. |
 | `cli`, `cmd/behemoth` | The command line: the commands as a library an application links, and the launcher that builds that link for it. Described in [`cli.md`](cli.md). |
 
 ### Declaration
@@ -847,6 +847,14 @@ The `PlanIssue.ID` being **stable and content-derived**( a hash of `table, kind,
 2. Resolution loads the _existing_ draft file, if one exists, and matches by `ID`. An issue whose `ID` already has a non-null `chosen` value in the file is treated as already-resolved and is never re-presented.
 3. Only new issues (new IDs, that are not present in the old draft) get appended, pending, for the developer to address.
 4. An issue whose `ID` no longer appears at all (because live state changed and the divergence is gone) is automatically dropped from the next draft.
+
+How it is built (2026-10-25), with the plan in [`../plans/migration_questions.md`](../plans/migration_questions.md):
+
+- **Pending is pending.** `FilePresenter.Present` writes a new issue with `"chosen": null` and the planner's suggestion as `"default"`, a hint that is never read as an answer. `ResolveIssues` fails closed on it with `unresolved_issues`, and the command line lists each open issue with its options. Until this, a new issue was written with its default chosen and read back in the same run, so nobody decided it.
+- **The terminal prompt.** `PromptPresenter` embeds the `FilePresenter` of the draft. Its `Present` asks each open issue, a new one or a stale one, and writes each answer to the file before it asks the next, as the convention above requires. `RunOptions.Presenter` puts it in front of the draft. The command line does so when its input is a terminal, unless `-no-input` is given.
+- **Answers given in advance.** `FilePresenter.Given` holds answers decided before the run, by question ID and option label: the command line's `-answer` flags. `Present` writes them into the draft before a prompt asks anything. A label that is not an option, or an ID the run does not raise, is refused with `invalid_answer`: a label, not an index, so that an answer given against other options can't select a different one.
+- **The other media** of the list above are later steps of the plan: an editor round trip, a local web page, and answers as data for the standalone service.
+- `ResolveIssues` keeps its `interactive` parameter, and no longer reads it: a presenter that asks does so in `Present`.
 
 
 ### Identity stability (edge cases)

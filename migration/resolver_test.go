@@ -136,9 +136,10 @@ func TestStaleDecisionRequiresReview(t *testing.T) {
 		return kinds
 	}
 
-	// First run writes the draft; the developer then chooses "Rename".
-	if _, err := resolve(issueWith(rename, dropAdd, leave)); err != nil {
-		t.Fatal(err)
+	// The first run writes the question, open, and stops on it. The
+	// developer then chooses "Rename".
+	if _, err := resolve(issueWith(rename, dropAdd, leave)); !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+		t.Fatalf("first run: want unresolved_issues, got %v", err)
 	}
 	edit(func(e *draftEntry) { i := 0; e.Chosen = &i })
 

@@ -3,6 +3,7 @@ package migration
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/go-behemoth/behemoth/errs"
@@ -162,7 +163,7 @@ func planColumns(table string, findings []ColumnFinding) ([]PlannedOperation, []
 			} else {
 				issues = append(issues, PlanIssue{
 					ID: opID, Table: table,
-					Description: fmt.Sprintf("Column %q's definition narrows (may reject or truncate existing data).", f.Name),
+					Description: fmt.Sprintf("Column %q's definition narrows (may reject or truncate existing data): %s.", f.Name, columnChange(*f.Live, *declared)),
 					Options: []ResolutionOption{
 						{
 							Label: "Apply alter",
@@ -629,4 +630,61 @@ func isNarrowingChange(live, declared schema.Column) bool {
 		live.AutoInc != declared.AutoInc ||
 		(hasDefault(live) && !hasDefault(declared)) ||
 		declared.Length < live.Length
+}
+
+// columnChange says what differs between a column's live and declared
+// definitions, in the terms isNarrowingChange decides on, for the question
+// a narrowing raises: "length 32 -> 16, null allowed -> not null".
+func columnChange(live, declared schema.Column) string {
+	var parts []string
+	if live.Type != declared.Type {
+		parts = append(parts, fmt.Sprintf("type %s -> %s", live.Type, declared.Type))
+	}
+	if live.Length != declared.Length {
+		parts = append(parts, fmt.Sprintf("length %s -> %s", lengthText(live.Length), lengthText(declared.Length)))
+	}
+	if live.Nullable != declared.Nullable {
+		parts = append(parts, nullText(live.Nullable)+" -> "+nullText(declared.Nullable))
+	}
+	if from, to := defaultText(live), defaultText(declared); from != to {
+		parts = append(parts, fmt.Sprintf("default %s -> %s", from, to))
+	}
+	if live.AutoInc != declared.AutoInc {
+		if declared.AutoInc {
+			parts = append(parts, "auto-increment added")
+		} else {
+			parts = append(parts, "auto-increment removed")
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func lengthText(n int) string {
+	if n == 0 {
+		return "none"
+	}
+	return strconv.Itoa(n)
+}
+
+func nullText(nullable bool) string {
+	if nullable {
+		return "null allowed"
+	}
+	return "not null"
+}
+
+// defaultText is a column's default as the question shows it. A default set
+// only in a database override has no single value to show.
+func defaultText(col schema.Column) string {
+	switch {
+	case col.Default != nil:
+		if s, ok := col.Default.(string); ok {
+			return strconv.Quote(s)
+		}
+		return fmt.Sprint(col.Default)
+	case hasDefault(col):
+		return "set per database"
+	default:
+		return "none"
+	}
 }

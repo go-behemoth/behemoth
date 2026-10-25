@@ -57,6 +57,12 @@ type RunOptions struct {
 	// event of an applied migration and for warnings about a script that
 	// could not be written.
 	Telemetry *telemetry.Telemetry
+
+	// Presenter shows the questions planning raises and collects their
+	// answers. nil keeps them in the draft file at DraftPath, where a run
+	// with an open question stops. A PromptPresenter over that file asks
+	// them in a terminal. Only Generate raises questions.
+	Presenter ResolutionPresenter
 }
 
 // draftFileName is the resolution draft's name inside FolderPath.
@@ -87,7 +93,7 @@ func DraftPath(cfg MigrationConfig) string {
 func Generate(ctx context.Context, cfg MigrationConfig, declared Declared, backend Backend, opts RunOptions) (*RunResult, error) {
 	const op = "Migration.Generate"
 	cfg = NewMigrationConfig(cfg)
-	generate, err := generateDeps(op, cfg, declared, backend)
+	generate, err := generateDeps(op, cfg, declared, backend, opts.Presenter)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +124,7 @@ func Migrate(ctx context.Context, cfg MigrationConfig, declared Declared, backen
 	if err := checkPath(op, cfg, PathManaged); err != nil {
 		return nil, err
 	}
-	generate, err := generateDeps(op, cfg, declared, backend)
+	generate, err := generateDeps(op, cfg, declared, backend, opts.Presenter)
 	if err != nil {
 		return nil, err
 	}
@@ -130,17 +136,20 @@ func Migrate(ctx context.Context, cfg MigrationConfig, declared Declared, backen
 }
 
 // generateDeps checks what both paths need and builds the dependencies they
-// share.
-func generateDeps(op string, cfg MigrationConfig, declared Declared, backend Backend) (GenerateDeps, error) {
+// share. A nil presenter is the FilePresenter at DraftPath.
+func generateDeps(op string, cfg MigrationConfig, declared Declared, backend Backend, presenter ResolutionPresenter) (GenerateDeps, error) {
 	if declared.Schemas == nil {
 		return GenerateDeps{}, errs.NewConfigurationError(op, "Declared.Schemas is nil: pass PreparedApp.Declared()", nil)
 	}
 	if backend.Introspector == nil {
 		return GenerateDeps{}, errs.NewConfigurationError(op, "Backend.Introspector is required", nil)
 	}
+	if presenter == nil {
+		presenter = NewFilePresenter(DraftPath(cfg))
+	}
 	return GenerateDeps{
 		Introspector: backend.Introspector,
-		Presenter:    NewFilePresenter(DraftPath(cfg)),
+		Presenter:    presenter,
 		Generator:    &DefaultMigrationGenerator{},
 		Renderer:     backend.Renderer,
 	}, nil

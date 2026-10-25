@@ -22,6 +22,9 @@ const (
 	// The answers a written migration used could not be removed from the
 	// resolution draft.
 	CodeMigrationDraftWriteFailed = "draft_write_failed"
+	// An answer given before the run names a question the run does not
+	// raise, or an option its question does not have.
+	CodeMigrationInvalidAnswer = "invalid_answer"
 	// A migration's Up could not be projected onto the snapshot.
 	CodeMigrationSnapshotProjectionFailed = "snapshot_projection_failed"
 

@@ -38,6 +38,25 @@ func answers(t *testing.T, dir string) map[string]int {
 	return out
 }
 
+// requireOpen fails unless the draft holds the question id, without an
+// answer.
+func requireOpen(t *testing.T, dir, id string) {
+	t.Helper()
+	questions, err := NewFilePresenter(filepath.Join(dir, draftFileName)).Questions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range questions {
+		if q.ID == id {
+			if q.Chosen != nil {
+				t.Errorf("question %s: chosen = %d, want it open", id, *q.Chosen)
+			}
+			return
+		}
+	}
+	t.Errorf("the draft has no question %q: %+v", id, questions)
+}
+
 // choose answers the draft's question id with option index, as a developer
 // does by editing the file.
 func choose(t *testing.T, dir, id string, index int) {
@@ -61,8 +80,7 @@ func choose(t *testing.T, dir, id string, index int) {
 
 // An answer that produced operations is used up by the migration it was
 // written into. A later change to the same column, here a second narrowing,
-// is asked again and starts from "Leave as-is", instead of reusing "Apply
-// alter". On both paths.
+// is asked again, instead of reusing "Apply alter". On both paths.
 func TestAnAnswerIsUsedUpByTheMigrationItWrites(t *testing.T) {
 	ctx := context.Background()
 
@@ -71,23 +89,21 @@ func TestAnAnswerIsUsedUpByTheMigrationItWrites(t *testing.T) {
 		cfg := MigrationConfig{FolderPath: dir}
 		db := newMemoryDatabase(usersWithEmail(255))
 		backend := Backend{Introspector: db, Renderer: scriptRenderer{}}
-		generate := func(length int, confirm bool) *RunResult {
-			t.Helper()
+		generate := func(length int, confirm bool) (*RunResult, error) {
 			declared := Declared{Schemas: declaredRegistry(t, usersWithEmail(length))}
-			res, err := Generate(ctx, cfg, declared, backend, RunOptions{Confirm: confirm})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return res
+			return Generate(ctx, cfg, declared, backend, RunOptions{Confirm: confirm})
 		}
 
-		// The first narrowing is asked, and answered with its default.
-		if res := generate(100, false); res.Status != StatusNoChanges {
-			t.Fatalf("first narrowing: status = %s, want %s", res.Status, StatusNoChanges)
+		// The first narrowing is a question, and the run stops on it.
+		if _, err := generate(100, false); !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+			t.Fatalf("first narrowing: err = %v, want %s", err, errs.CodeMigrationUnresolvedIssues)
 		}
 		choose(t, dir, narrowEmail, 0) // Apply alter
 
-		res := generate(100, true)
+		res, err := generate(100, true)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if res.Status != StatusGenerated || len(res.Migration.Up) != 1 || res.Migration.Up[0].Kind != OpAlterColumn {
 			t.Fatalf("with Apply alter: status = %s, migration = %+v; want the alter written", res.Status, res.Migration)
 		}
@@ -100,23 +116,26 @@ func TestAnAnswerIsUsedUpByTheMigrationItWrites(t *testing.T) {
 
 		// The application applies the script, and narrows the column again.
 		db.live["users"] = usersWithEmail(100)
-		if res := generate(50, false); res.Status != StatusNoChanges {
-			t.Fatalf("second narrowing: status = %s, migration = %+v; want it asked again, not altered", res.Status, res.Migration)
+		if res, err := generate(50, false); !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+			t.Fatalf("second narrowing: err = %v, result = %+v; want it asked again, not altered", err, res)
 		}
-		if got, ok := answers(t, dir)[narrowEmail]; !ok || got != 1 {
-			t.Errorf("second narrowing: answer = %d (present %v), want the default, Leave as-is (1)", got, ok)
-		}
+		requireOpen(t, dir, narrowEmail)
 	})
 
 	t.Run("managed", func(t *testing.T) {
 		r := newManagedRun(t, newMemoryDatabase(), usersWithEmail(255))
 		r.generate(true)
 		r.migrate(true)
+		stops := func(when string) {
+			t.Helper()
+			res, err := Generate(ctx, r.cfg, r.declared, r.db.backend(), RunOptions{})
+			if !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+				t.Fatalf("%s: err = %v, result = %+v; want the run stopped on the question", when, err, res)
+			}
+		}
 
 		r.declared = Declared{Schemas: declaredRegistry(t, usersWithEmail(100))}
-		if res := r.generate(false); res.Status != StatusNoChanges {
-			t.Fatalf("first narrowing: status = %s, want %s", res.Status, StatusNoChanges)
-		}
+		stops("first narrowing")
 		choose(t, r.cfg.FolderPath, narrowEmail, 0)
 		if res := r.generate(true); res.Status != StatusGenerated || !strings.Contains(res.Message, "removed from the draft") {
 			t.Fatalf("with Apply alter: status = %s, message = %q", res.Status, res.Message)
@@ -124,12 +143,8 @@ func TestAnAnswerIsUsedUpByTheMigrationItWrites(t *testing.T) {
 		r.migrate(true)
 
 		r.declared = Declared{Schemas: declaredRegistry(t, usersWithEmail(50))}
-		if res := r.generate(false); res.Status != StatusNoChanges {
-			t.Fatalf("second narrowing: status = %s, migration = %+v; want it asked again, not altered", res.Status, res.Migration)
-		}
-		if got := answers(t, r.cfg.FolderPath)[narrowEmail]; got != 1 {
-			t.Errorf("second narrowing: answer = %d, want the default, Leave as-is (1)", got)
-		}
+		stops("second narrowing")
+		requireOpen(t, r.cfg.FolderPath, narrowEmail)
 	})
 }
 
@@ -145,8 +160,13 @@ func TestLeaveAsIsSurvivesAWrittenMigration(t *testing.T) {
 	declaredUsers := usersWithEmail(100) // narrowed, and left as it is
 	declaredUsers.Columns = append(declaredUsers.Columns, schema.Column{Name: "name", Type: schema.ColTypeString, Length: 64, Nullable: true})
 	declared := Declared{Schemas: declaredRegistry(t, declaredUsers)}
+	backend := Backend{Introspector: db, Renderer: scriptRenderer{}}
 
-	res, err := Generate(ctx, cfg, declared, Backend{Introspector: db, Renderer: scriptRenderer{}}, RunOptions{Confirm: true})
+	if _, err := Generate(ctx, cfg, declared, backend, RunOptions{Confirm: true}); !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+		t.Fatalf("err = %v, want the run stopped on the question", err)
+	}
+	choose(t, dir, narrowEmail, 1) // Leave as-is
+	res, err := Generate(ctx, cfg, declared, backend, RunOptions{Confirm: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,21 +202,29 @@ func TestFilePresenterConsume(t *testing.T) {
 	if err := p.Present(ctx, issues, nil); err != nil {
 		t.Fatal(err)
 	}
+	ids := func() []string {
+		t.Helper()
+		questions, err := p.Questions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, q := range questions {
+			out = append(out, q.ID)
+		}
+		return out
+	}
 	if err := p.Consume(ctx, []string{"b", "unknown"}); err != nil {
 		t.Fatal(err)
 	}
-	left, err := p.Collect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := left["b"]; ok || len(left) != 2 {
+	if left := ids(); len(left) != 2 || left[0] != "a" || left[1] != "c" {
 		t.Errorf("after consuming b: %v, want a and c", left)
 	}
 
 	if err := p.Consume(ctx, []string{"a", "c"}); err != nil {
 		t.Fatal(err)
 	}
-	if left, _ := p.Collect(ctx); len(left) != 0 {
+	if left := ids(); len(left) != 0 {
 		t.Errorf("after consuming all: %v, want none", left)
 	}
 }
@@ -222,8 +250,8 @@ func TestAFailedConsumeNamesTheAnswers(t *testing.T) {
 		Renderer:     scriptRenderer{},
 	}
 
-	if _, err := RunGenerateCLI(ctx, cfg, declared, deps, false); err != nil {
-		t.Fatal(err)
+	if _, err := RunGenerateCLI(ctx, cfg, declared, deps, false); !errs.IsCode(err, errs.CodeMigrationUnresolvedIssues) {
+		t.Fatalf("err = %v, want the run stopped on the question", err)
 	}
 	choose(t, dir, narrowEmail, 0)
 	_, err := RunGenerateCLI(ctx, cfg, declared, deps, true)

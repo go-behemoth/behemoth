@@ -106,7 +106,7 @@ behemoth generate -confirm
 psql "$DATABASE_URL" -f migrations/0002_add_column_notes_title.sql
 ```
 
-## Answer a question in the draft file
+## Answer a question
 
 Some changes need your decision. A narrower column can reject or cut existing values, so Behemoth doesn't alter it unless you choose to. Narrow `plan` from 32 to 16 characters in `auth/schema.go`:
 
@@ -114,50 +114,33 @@ Some changes need your decision. A narrower column can reject or cut existing va
 Type: schema.ColTypeString, Length: 16, Default: "free",
 ```
 
-Then preview:
+The command asks you when it runs in a terminal, and `docker compose run` gives it one:
 
 ```bash
 docker compose run --rm --build --entrypoint behemoth migrate generate
 ```
 
 ```
-No schema changes detected.
+1 question needs an answer. Each answer is saved to migrations/draft.json as you give it.
 
-1 answer(s) were read from migrations/draft.json. A new question starts with its default answer, which changes nothing. Edit the file and run the command again to choose another.
+Question 1 of 1 (alter_column_users_plan)
+users: Column "plan"'s definition narrows (may reject or truncate existing data): length 32 -> 16.
+
+  1) Apply alter
+  2) Leave as-is (default)
+Answer [2]: 1
+
+Migration 0002 ready (not yet written). Re-run with --confirm to write it to migrations.
+
+0002, 1 operation(s):
+  alter column users.plan
+
+Answers read from migrations/draft.json:
+  alter_column_users_plan: Apply alter
+To change an answer, edit the file and run the command again.
 ```
 
-The question is in `migrations/draft.json`, with its default answer, "Leave as-is":
-
-```json
-{
-  "entries": [
-    {
-      "id": "alter_column_users_plan",
-      "table": "users",
-      "description": "Column \"plan\"'s definition narrows (may reject or truncate existing data).",
-      "options": [
-        "Apply alter",
-        "Leave as-is"
-      ],
-      "chosen": 1
-    }
-  ]
-}
-```
-
-`chosen` is the position of the answer in `options`, counted from 0. To apply the alter, set it to `0`. With Docker, the file is in the volume. Open it in `vi`:
-
-```bash
-docker compose run --rm --entrypoint vi migrate migrations/draft.json
-```
-
-Or change it with one command. This sets every answer in the file to the first option, so use it only while the file holds one question:
-
-```bash
-docker compose run --rm --entrypoint sed migrate -i 's/"chosen": 1/"chosen": 0/' migrations/draft.json
-```
-
-Then run the job again:
+Type the number of an answer, or press Enter for the default. The answer is saved in `migrations/draft.json`, in the volume. Run the job, and it writes and applies the migration with that answer:
 
 ```bash
 docker compose up --build -d
@@ -165,11 +148,67 @@ docker compose logs migrate
 docker compose exec db psql -U postgres -d behemoth -c '\d users'
 ```
 
-The job writes and applies `0002_alter_column_users_plan`, and `plan` becomes `character varying(16)`.
+The job writes and applies `0002_alter_column_users_plan`, and `plan` becomes `character varying(16)`. Its output ends with `The 1 answer(s) it used were removed from the draft`. Narrow `plan` again, to 8 for example, and you are asked again. Press Enter for "Leave as-is", and the job reports `No schema changes detected.` and names the answer it read. A "Leave as-is" answer stays in the draft, so a column you chose to leave as it is isn't asked about again.
 
-Without Docker, edit `migrations/draft.json` in your editor, run `behemoth generate -confirm`, and apply the script with `psql`.
+Without Docker, run `behemoth generate` in your terminal to answer, then `behemoth generate -confirm`, and apply the script with `psql`.
 
-Once the migration is written, the job's output ends with `The 1 answer(s) it used were removed from the draft`. Narrow `plan` again, to 8 for example, and the new question starts from "Leave as-is": the earlier "Apply alter" is not reused. A "Leave as-is" answer stays in the draft, so a column you chose to leave as it is isn't asked about again.
+### Without a terminal
+
+The job that `docker compose up` runs has no terminal. If you run `up` before you answer, the job stops and lists the question, with the `"chosen"` value of each option:
+
+```
+behemoth generate: 1 question has no answer:
+
+  alter_column_users_plan
+  users: Column "plan"'s definition narrows (may reject or truncate existing data): length 32 -> 16.
+    "chosen": 0  Apply alter
+    "chosen": 1  Leave as-is (default)
+
+Answer in a terminal, with -answer, such as -answer 'alter_column_users_plan=Leave as-is', or by setting "chosen" in migrations/draft.json (and deleting "stale" where it is set). Then run the command again.
+```
+
+The server stays stopped until the job succeeds. Answer the question, then run `docker compose up -d` again.
+
+To answer on the command line, give `-answer` the question's id and the label of one of its options. The job passes its arguments to `generate`, so one run of it answers, writes the migration, and applies it:
+
+```bash
+docker compose run --rm --build migrate -answer 'alter_column_users_plan=Apply alter'
+docker compose up --build -d
+```
+
+The second command starts the server. Its job finds no change left to make.
+
+You can also answer in the draft file. `chosen` is the position of the answer in `options`, counted from 0, and is `null` until the question is answered. `default` is the answer Enter would pick:
+
+```json
+{
+  "entries": [
+    {
+      "id": "alter_column_users_plan",
+      "table": "users",
+      "description": "Column \"plan\"'s definition narrows (may reject or truncate existing data): length 32 -> 16.",
+      "options": [
+        "Apply alter",
+        "Leave as-is"
+      ],
+      "default": 1,
+      "chosen": null
+    }
+  ]
+}
+```
+
+The file is in the volume. Open it in `vi`:
+
+```bash
+docker compose run --rm --entrypoint vi migrate migrations/draft.json
+```
+
+Or answer with one command. This answers every open question in the file with its first option, so use it only while the file holds one question:
+
+```bash
+docker compose run --rm --entrypoint sed migrate -i 's/"chosen": null/"chosen": 0/' migrations/draft.json
+```
 
 ## The commands
 
@@ -180,7 +219,7 @@ Once the migration is written, the job's output ends with `The 1 answer(s) it us
 | `behemoth migrate` | Shows the migration that is waiting to be applied. Managed path only. |
 | `behemoth migrate -confirm` | Applies that migration and records it. Managed path only. |
 
-`generate` never changes the database. In Docker, run a command with `docker compose run --rm --entrypoint behemoth migrate COMMAND`, where `COMMAND` is `generate`, `migrate`, and their flags.
+`generate` never changes the database. In a terminal, it asks the questions a change raises, and `-no-input` turns that off. `-answer ID=LABEL` answers a question on the command line. In Docker, run a command with `docker compose run --rm --entrypoint behemoth migrate COMMAND`, where `COMMAND` is `generate`, `migrate`, and their flags.
 
 This example is on the generate-only path, so `migrate` refuses:
 
@@ -221,5 +260,5 @@ Without Docker, the commands are `behemoth generate -confirm`, `behemoth migrate
 
 ## Learn more
 
-- [Command line](../../docs/api/cli.md): every command, the draft file, and the launcher.
+- [Command line](../../docs/api/cli.md): every command, its questions and the draft file, and the launcher.
 - [Email and password](../../docs/api/emailpassword.md): the routes the server mounts.

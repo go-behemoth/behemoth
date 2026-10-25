@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-behemoth/behemoth"
 	"github.com/go-behemoth/behemoth/clause"
@@ -150,11 +152,35 @@ func (l fixtureLedger) FindOne(context.Context, behemoth.Model, clause.Expressio
 	return &migration.SchemaSnapshot{Version: l.f.version, Tables: l.f.tables}, nil
 }
 
-// run runs the command line against f and returns its exit code and output.
+// run runs the command line against f, with nobody to answer its
+// questions, and returns its exit code and output.
 func (f *fixture) run(args ...string) (code int, stdout, stderr string) {
+	return f.runWith(nil, args...)
+}
+
+// runWith runs the command line against f, reading answers from stdin.
+func (f *fixture) runWith(stdin io.Reader, args ...string) (code int, stdout, stderr string) {
 	var out, errOut bytes.Buffer
-	code = Run(context.Background(), args, &out, &errOut, f.prepare, f.backend)
+	code = Run(context.Background(), args, stdin, &out, &errOut, f.prepare, f.backend)
 	return code, out.String(), errOut.String()
+}
+
+// narrowNotes makes the database's notes.id wider than the declared one,
+// so generate raises a question about narrowing it.
+func (f *fixture) narrowNotes(t *testing.T) {
+	t.Helper()
+	app, err := f.prepare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range app.Schemas.All() {
+		if table.Name == "notes" {
+			cols := append([]schema.Column(nil), table.Columns...)
+			cols[0].Length += 10
+			table.Columns = cols
+		}
+		f.live[table.Name] = table
+	}
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -241,32 +267,133 @@ func TestGenerateWithNothingToDo(t *testing.T) {
 	}
 }
 
-// A narrowing change raises a question, and planning answers a new question
-// with "leave as-is". The command says that an answer was read, so a run
-// that reports no changes is not taken for a database that matches.
-func TestGenerateSaysWhenAnswersWereRead(t *testing.T) {
+// A narrowing change raises a question. With nobody to answer it, the run
+// stops and lists the question, with the "chosen" value of each option and
+// the draft to set it in, instead of leaving the change out unasked.
+func TestGenerateStopsOnAnOpenQuestion(t *testing.T) {
 	f := newFixture(t)
-	app, err := f.prepare()
+	f.narrowNotes(t)
+
+	code, stdout, stderr := f.run("generate", "-confirm")
+	if code != ExitFailure {
+		t.Fatalf("exit code = %d, want %d\nstdout: %s\nstderr: %s", code, ExitFailure, stdout, stderr)
+	}
+	draft := filepath.Join(f.dir, "draft.json")
+	for _, want := range []string{
+		"behemoth generate: 1 question has no answer:\n",
+		"  alter_column_notes_id\n",
+		`notes: Column "id"'s definition narrows (may reject or truncate existing data): length 46 -> 36.`,
+		`    "chosen": 0  Apply alter`,
+		`    "chosen": 1  Leave as-is (default)`,
+		"Answer in a terminal, with -answer, such as -answer 'alter_column_notes_id=Leave as-is', or by setting \"chosen\" in " + draft + ` (and deleting "stale" where it is set). Then run the command again.`,
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	if files, _ := filepath.Glob(filepath.Join(f.dir, "0001_*")); len(files) != 0 {
+		t.Errorf("a run that stopped wrote %v", files)
+	}
+}
+
+// In a terminal, generate asks the question on stderr and saves the answer.
+// The run's report names the answers it read, and the next run, with nobody
+// to ask, reads the saved one.
+func TestGenerateAsksInATerminal(t *testing.T) {
+	f := newFixture(t)
+	f.narrowNotes(t)
+	draft := filepath.Join(f.dir, "draft.json")
+
+	code, stdout, stderr := f.runWith(strings.NewReader("1\n"), "generate")
+	if code != ExitOK {
+		t.Fatalf("exit code = %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"1 question needs an answer. Each answer is saved to " + draft,
+		"Question 1 of 1 (alter_column_notes_id)",
+		"  1) Apply alter\n  2) Leave as-is (default)\n",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr lacks %q:\n%s", want, stderr)
+		}
+	}
+	for _, want := range []string{"alter column notes.id", "Answers read from " + draft + ":\n  alter_column_notes_id: Apply alter"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, stdout)
+		}
+	}
+
+	code, stdout, stderr = f.run("generate", "-confirm")
+	if code != ExitOK || !strings.Contains(stdout, "alter column notes.id") || !strings.Contains(stdout, "removed from the draft") {
+		t.Errorf("generate -confirm with the saved answer: exit code = %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+// -no-input never asks, even with someone there to answer.
+func TestGenerateWithNoInputDoesNotAsk(t *testing.T) {
+	f := newFixture(t)
+	f.narrowNotes(t)
+
+	code, _, stderr := f.runWith(strings.NewReader("1\n"), "generate", "-no-input")
+	if code != ExitFailure || strings.Contains(stderr, "Question 1 of 1") || !strings.Contains(stderr, "1 question has no answer") {
+		t.Errorf("exit code = %d, stderr = %q; want the run stopped without asking", code, stderr)
+	}
+	if !strings.Contains(stderr, "Answer in a terminal without -no-input, with -answer") {
+		t.Errorf("stderr = %q; want the way to be asked named", stderr)
+	}
+	if code, _, stderr := f.run("migrate", "-no-input"); code != ExitUsage || !strings.Contains(stderr, "flag provided but not defined") {
+		t.Errorf("migrate -no-input: exit code = %d, stderr = %q; want a usage error, migrate asks nothing", code, stderr)
+	}
+}
+
+// An interrupt while generate waits for an answer ends the command, and says
+// that the answers given are kept.
+func TestGenerateInterruptedWhileAsking(t *testing.T) {
+	f := newFixture(t)
+	f.narrowNotes(t)
+	in, answers := io.Pipe()
+	defer answers.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	var out, errOut bytes.Buffer
+	code := Run(ctx, []string{"generate"}, in, &out, &errOut, f.prepare, f.backend)
+	if code != ExitFailure || !strings.Contains(errOut.String(), "interrupted. The answers given so far are saved in") {
+		t.Errorf("exit code = %d, stderr = %q", code, errOut.String())
+	}
+}
+
+// Only a terminal is asked: not a pipe, a regular file or os.DevNull. A
+// reader that is not a file is read as answers.
+func TestAnswerer(t *testing.T) {
+	if answerer(nil) != nil {
+		t.Error("nil input: want nobody to ask")
+	}
+	r := strings.NewReader("1\n")
+	if answerer(r) != io.Reader(r) {
+		t.Error("a reader that is not a file: want it read")
+	}
+
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range app.Schemas.All() {
-		if table.Name == "notes" {
-			// The live column is wider than the declared one.
-			cols := append([]schema.Column(nil), table.Columns...)
-			cols[0].Length += 10
-			table.Columns = cols
+	defer pr.Close()
+	defer pw.Close()
+	regular, err := os.Create(filepath.Join(t.TempDir(), "answers"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regular.Close()
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	for name, f := range map[string]*os.File{"a pipe": pr, "a regular file": regular, "os.DevNull": null} {
+		if answerer(f) != nil {
+			t.Errorf("%s: want nobody to ask", name)
 		}
-		f.live[table.Name] = table
-	}
-
-	code, stdout, stderr := f.run("generate")
-	if code != ExitOK {
-		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
-	}
-	draft := filepath.Join(f.dir, "draft.json")
-	if !strings.Contains(stdout, "1 answer(s) were read from "+draft) {
-		t.Errorf("stdout does not point at the draft:\n%s", stdout)
 	}
 }
 
@@ -334,7 +461,7 @@ func TestGenerateReportsFailures(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	if code := Run(context.Background(), []string{"generate"}, &out, &errOut, nil, nil); code != ExitFailure {
+	if code := Run(context.Background(), []string{"generate"}, nil, &out, &errOut, nil, nil); code != ExitFailure {
 		t.Errorf("no functions: exit code = %d, want %d", code, ExitFailure)
 	}
 }
@@ -355,6 +482,70 @@ func TestDescribe(t *testing.T) {
 	} {
 		if got := describe(op); got != want {
 			t.Errorf("describe(%s) = %q, want %q", op.Kind, got, want)
+		}
+	}
+}
+
+// -answer answers a question without a terminal, and the run goes on.
+func TestGenerateWithAnswerFlags(t *testing.T) {
+	f := newFixture(t)
+	f.narrowNotes(t)
+
+	code, stdout, stderr := f.run("generate", "-confirm", "-answer", "alter_column_notes_id=Apply alter")
+	if code != ExitOK {
+		t.Fatalf("exit code = %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "alter column notes.id") || !strings.Contains(stdout, "removed from the draft") {
+		t.Errorf("stdout = %q, want the alter written with the given answer", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, "0001_alter_column_notes_id.json")); err != nil {
+		t.Errorf("the migration was not written: %v", err)
+	}
+}
+
+// A malformed or repeated -answer is a usage error, found before the
+// database is opened. migrate asks nothing, so it has no -answer.
+func TestAnswerFlagUsage(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args     []string
+		inStderr string
+	}{
+		"no equals sign": {[]string{"generate", "-answer", "alter_column_notes_id"}, `"alter_column_notes_id" is not ID=LABEL`},
+		"empty label":    {[]string{"generate", "-answer", "alter_column_notes_id= "}, "is not ID=LABEL"},
+		"answered twice": {[]string{"generate", "-answer", "a=Apply alter", "-answer", "a=Leave as-is"}, "a is answered twice"},
+		"on migrate":     {[]string{"migrate", "-answer", "a=Apply alter"}, "flag provided but not defined: -answer"},
+	} {
+		f := newFixture(t)
+		code, _, stderr := f.run(tc.args...)
+		if code != ExitUsage || !strings.Contains(stderr, tc.inStderr) {
+			t.Errorf("%s: exit code = %d, stderr = %q; want %d and %q", name, code, stderr, ExitUsage, tc.inStderr)
+		}
+		if f.opened != 0 {
+			t.Errorf("%s: the database was opened", name)
+		}
+	}
+
+	f := newFixture(t)
+	if code, _, stderr := f.run("generate", "-h"); code != ExitOK || !strings.Contains(stderr, "-answer ID=LABEL") {
+		t.Errorf("generate -h: exit code = %d, stderr = %q; want -answer described", code, stderr)
+	}
+}
+
+// An answer for a question the run does not raise, or with a label that is
+// not one of its options, stops the run and says why.
+func TestGenerateRefusesAnAnswerThatAnswersNothing(t *testing.T) {
+	for name, tc := range map[string]struct {
+		answer   string
+		inStderr string
+	}{
+		"unknown question": {"alter_column_notes_idd=Apply alter", `names a question this run does not raise: it raises alter_column_notes_id`},
+		"unknown option":   {"alter_column_notes_id=Alter", `behemoth generate: the answer "Alter" for alter_column_notes_id is not one of its options: "Apply alter", "Leave as-is"`},
+	} {
+		f := newFixture(t)
+		f.narrowNotes(t)
+		code, _, stderr := f.run("generate", "-answer", tc.answer)
+		if code != ExitFailure || !strings.Contains(stderr, tc.inStderr) {
+			t.Errorf("%s: exit code = %d, stderr = %q; want %d and %q", name, code, stderr, ExitFailure, tc.inStderr)
 		}
 	}
 }

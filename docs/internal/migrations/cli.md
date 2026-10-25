@@ -5,7 +5,7 @@ This document explains how `behemoth generate` reaches an application's declarat
 The code lives in:
 
 - `migration/backend.go`: `Backend`, `Generate`, `Migrate`, `RunOptions`, `DraftPath`
-- `storage/adapters/postgres/backend.go`: `MigrationBackend`
+- `storage/adapters/postgres/backend.go`, `storage/adapters/mysql/backend.go`: `MigrationBackend`
 - `cli/`: the commands, as a library
 - `cmd/behemoth/`: the launcher, the program a developer installs
 - `examples/cli/`: an application that uses both
@@ -41,7 +41,7 @@ behemoth generate
 behemoth migrate takes the same route to migration.Migrate and RunManagedApply.
 ```
 
-**`migration.Backend`, `migration.Generate`, and `migration.Migrate`.** `Backend` holds what the pipeline needs from one database: `Introspector`, `Renderer`, `Driver`, `DB`, and `Close`. `Generate` and `Migrate` take it with the configuration and the declarations, and do the wiring. They are described in the design document under *Entry points*. `postgres.MigrationBackend(db, resolver)` fills a `Backend` from one `*sql.DB`.
+**`migration.Backend`, `migration.Generate`, and `migration.Migrate`.** `Backend` holds what the pipeline needs from one database: `Introspector`, `Renderer`, `Driver`, `DB`, and `Close`. `Generate` and `Migrate` take it with the configuration and the declarations, and do the wiring. They are described in the design document under *Entry points*. `postgres.MigrationBackend(db, resolver)` and `mysql.MigrationBackend(db, resolver)` fill a `Backend` from one `*sql.DB`.
 
 **The `cli` package.** The commands as a library. An application gives it two functions:
 
@@ -49,22 +49,23 @@ behemoth migrate takes the same route to migration.Migrate and RunManagedApply.
 type PrepareFunc func() (*engine.PreparedApp, error)
 type BackendFunc func(ctx context.Context, app *engine.PreparedApp) (migration.Backend, error)
 
-func Main(prepare PrepareFunc, backend BackendFunc)                                             // os.Args, exits
-func Run(ctx context.Context, args []string, stdout, stderr io.Writer, prepare PrepareFunc, backend BackendFunc) int
+func Main(prepare PrepareFunc, backend BackendFunc)                                                          // os.Args, os.Stdin, exits
+func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, prepare PrepareFunc, backend BackendFunc) int
 ```
 
 `BackendFunc` receives the prepared application because the backend has to be built with its resolver. `Run` is `Main` without the process: tests call it, and an application can call it to offer the commands from its own binary.
 
 Both commands are one `command` value and run the same steps (`command.exec`):
 
-1. Parse `-confirm`. An unknown flag or a stray argument ends with the usage and exit code 2.
+1. Parse `-confirm`, and `-no-input` and `-answer` for `generate`, the command that can raise questions (`asks`). An unknown flag, a malformed or repeated `-answer` (`answers.Set`), or a stray argument ends with the usage and exit code 2.
 2. Call the `PrepareFunc`.
 3. Ask the command whether it applies to `app.Migration.Path` (`refuse`), before the database is opened. `generate` always does. `migrate` refuses `PathGenerateOnly`, with a message that names `generate`.
 4. Call the `BackendFunc`, and call the backend's `Close` when the command ends.
-5. Call `migration.Generate` or `migration.Migrate`. Warnings of the managed path go to stderr through a text logger.
-6. Print core's message, then one line per operation of the migration (`describe`), then a note when answers were read from the draft file.
+5. For `generate`, put the draft's `FilePresenter` in `RunOptions.Presenter`, with the `-answer` values as its `Given` answers. Without `-no-input`, and with someone to answer on `stdin` (`answerer`), put a `PromptPresenter` over it instead. Its questions go to stderr.
+6. Call `migration.Generate` or `migration.Migrate`. Warnings of the managed path go to stderr through a text logger.
+7. Print core's message, then one line per operation of the migration (`describe`), then the answers read from the draft file.
 
-Exit codes are 0 when the command ran, with or without changes, 1 when it failed and 2 for a usage error.
+Exit codes are 0 when the command ran, with or without changes, 1 when it failed or stopped on an open question, and 2 for a usage error.
 
 **The launcher, `cmd/behemoth`.** The program that makes `behemoth generate` work in an application's directory. It contains no command. It builds this program inside the application's module and runs it:
 
@@ -189,30 +190,39 @@ In `examples/cli`, `behemoth generate` takes about half a second with a warm bui
 
 **Decision:** a struct with a `Close` field. `postgres.MigrationBackend` sets it to `db.Close`, as wrappers such as `sqlx.NewDb` close the handle they were given. `core` never calls it. The `cli` package does, and a caller that shares the `*sql.DB` leaves it alone.
 
-## What the command shows of the draft
+## Asking the questions
 
-Planning writes each new question to `draft.json` with its default answer already chosen, and reads that answer back in the same run. Every default is "Leave as-is", so the change behind the question is left out of the migration. A run can therefore report `No schema changes detected.` while a declared column differs from the database.
+Planning writes a new question to `draft.json` open: `"chosen": null`, with the planner's suggestion in `"default"`. Nobody decides it by default, so a run that nobody can be asked in stops with `unresolved_issues`. [`../plans/migration_questions.md`](../plans/migration_questions.md) has the plan, and the reasoning for stopping.
 
-`report` calls `FilePresenter.Collect` after the run and prints how many answers were read and where the file is. That is the only notice the developer gets. The command cannot show the questions themselves, because the draft's entry type is unexported in `core`.
+In a terminal, `generate` asks. `migration.PromptPresenter` embeds the `FilePresenter` of the draft: its `Present` lets the file presenter write the draft, asks each open question on stderr, and saves each answer with `FilePresenter.answer` before it asks the next. A read waits in a goroutine (`lineReader`), so an interrupt ends the command while it waits, and the command says that the answers given are kept.
 
-When a command fails with `unresolved_issues`, the command adds a line that names the draft file.
+`-answer ID=LABEL` answers without a terminal. The values become `FilePresenter.Given`, which `Present` writes into the draft by label, compared without regard to case, before the prompt asks anything. A given answer replaces the draft's and clears a stale flag. One that names a question the run does not raise, or a label that is not an option, is refused with `invalid_answer`, after the draft is written; the command prints the reason alone, without the operation that refused it. `migrate.sh` in the example passes its arguments to `generate`, so the compose job takes `-answer` too.
 
-A run that writes a migration removes from the draft the answers it used, those whose option produced operations, and core's message ends with a sentence that says so. `report` counts what is left, so that run's note leaves them out. See *Draft lifecycle* in the design document.
+`answerer` decides whether someone can answer. A reader that is not an `*os.File` is read, which is how the tests answer. A file is read only when it is a character device other than `os.DevNull`. A container started without a TTY gets its own `/dev/null` as its input, which is a character device. `golang.org/x/term` would be exact, but the launcher builds this package inside the application's module, whose `go.sum` has no checksum for a module only `cli` imports, so the build would fail. The plan's design decisions have the details.
+
+What the command prints of the draft:
+
+- **A run that stopped:** each open question with its description, and each option with its `"chosen"` value, then how to answer, with an `-answer` for the first question as an example (`openQuestions`). The description of a narrowing says what changes ("length 32 -> 16"), from `columnChange` in the planner.
+- **A run that went through:** the answers it read, by question (`report`). A "Leave as-is" keeps a difference out of the migration, and the run can then report `No schema changes detected.` while a column differs, so each answer is named.
+- Both read `FilePresenter.Questions`, an exported view of the draft's entries (`migration.Question`).
+
+A run that writes a migration removes from the draft the answers it used, those whose option produced operations, and core's message ends with a sentence that says so. See *Draft lifecycle* in the design document.
 
 ## Tests
 
 | Test | Covers |
 | --- | --- |
 | `migration/backend_test.go` | The checks of `Generate` and `Migrate`, the path checks of the entry points below them, the generate-only path from preview to "no changes", and the managed path through both: a new database, an existing one with its baseline, and a baseline that went stale. `memoryDatabase` is an introspector, a driver and a ledger in memory. |
-| `cli/cli_test.go` | Usage and exit codes, `generate` with and without `-confirm`, `generate` then `migrate` on the managed path, `migrate` refused on `PathGenerateOnly`, failures of the two functions, the draft note, `describe`. The application is a real `Prepare` with an application table; the database is a map. |
+| `cli/cli_test.go` | Usage and exit codes, `generate` with and without `-confirm`, `generate` then `migrate` on the managed path, `migrate` refused on `PathGenerateOnly`, failures of the two functions, a run that stops on a question and lists it, a question asked and answered, `-no-input`, an interrupt while asking, `-answer` and its usage errors and refusals, `answerer` on a pipe, a regular file and `os.DevNull`, `describe`. The application is a real `Prepare` with an application table; the database is a map. |
+| `migration/prompt_test.go` | A new question left open, `Question.Open`, the prompt asking open questions only, saving each answer, asking again on a bad answer, stopping at the end of the input and on an interrupt, `RunOptions.Presenter` through `Generate`, `columnChange`, a draft written without HTML escapes. |
+| `migration/given_test.go` | `FilePresenter.Given`: an answer matched by label and saved, one that replaces the draft's and clears a stale flag, refused answers, and given answers before the prompt. |
 | `cmd/behemoth/main_test.go` | `findApp`, `checkEntryPoints`, the generated source, and `TestLauncherRunsAnApplication`, which writes a module to a temporary directory, runs the launcher in it and checks the migration file, the untouched tree and the exit code. It is skipped with `-short`. |
-| `tests/storage/migrations/backend_test.go` | `postgres.MigrationBackend` in a container: physical names in the script, the script applied, a second run without changes, and the driver and the adapter agreeing on the ledger. |
+| `tests/storage/migrations/backend_test.go` | `postgres.MigrationBackend` and `mysql.MigrationBackend` in containers. `migrationBackend`: physical names in the script, the script applied, a second run without changes, and the driver and the adapter agreeing on the ledger. `migrationPipeline`, over every core table and one of the application's own: the generate-only path, the managed path, a baseline, and `cli.Run`, each with a narrowing that raises a question, and the declarations compared with the live database after each migration. `mysqlScriptWentStale`: an index on a `TEXT` column whose type changes between `generate` and `migrate`, so `migrate` writes the script again and applies nothing. The MySQL tests ran on 8.0, 8.4 and 9 on 2026-10-25. |
 
 ## Deferred
 
 These parts are deferred:
 
-- **Asking the questions.** `ResolveIssues` has an empty `if interactive` branch that leaves a prompt to this layer. The design document requires a prompt to write every answer through to the draft file. Showing the questions needs an exported view of the draft's entries.
 - **`--previous <id>` and `behemoth schema snapshot`,** which the design document names for `PathGenerateOnly`.
-- **Constructors for SQLite, MySQL, and SQL Server.** Each is the five lines of `postgres.MigrationBackend`. Until then an application on one of them fills `migration.Backend` itself.
+- **Constructors for SQLite and SQL Server.** Each is the five lines of `postgres.MigrationBackend` or `mysql.MigrationBackend`. Until then an application on one of them fills `migration.Backend` itself.
 - **The audit event of an applied migration.** `migrate` sets no audit recorder, so none is written. The audit table may be created by the very migration being applied.
