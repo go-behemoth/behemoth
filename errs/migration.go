@@ -19,6 +19,9 @@ const (
 	CodeMigrationDependencyCycle = "dependency_cycle"
 	// The resolution draft file could not be read.
 	CodeMigrationDraftReadFailed = "draft_read_failed"
+	// The answers a written migration used could not be removed from the
+	// resolution draft.
+	CodeMigrationDraftWriteFailed = "draft_write_failed"
 	// A migration's Up could not be projected onto the snapshot.
 	CodeMigrationSnapshotProjectionFailed = "snapshot_projection_failed"
 

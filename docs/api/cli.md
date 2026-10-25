@@ -154,6 +154,14 @@ The file lists each question with its options. `chosen` is the position of the a
 
 Set `chosen` to `0` and run `behemoth generate` again to get the alter. Read the last lines of the output before you trust "No schema changes detected", because the command prints it even when it read answers from the draft file.
 
+An answer that changes your database, such as "Apply alter", is used once. When `generate -confirm` writes the migration, it removes that answer from the file and says so:
+
+```
+Migration 0002 written to migrations/0002_alter_column_users_plan.json, with its script at migrations/0002_alter_column_users_plan.sql. Hand off the script to your own migration tool. The 1 answer(s) it used were removed from the draft, so a later change to the same column is asked again.
+```
+
+A later change to the same column starts again from "Leave as-is". A "Leave as-is" answer stays in the file, so a column you chose to leave as it is isn't asked about again.
+
 ## `migrate`
 
 `migrate` is for an application whose `MigrationConfig.Path` is `migration.PathManaged`. There Behemoth applies the migrations itself and keeps a record of them in two tables of its own.

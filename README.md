@@ -107,7 +107,13 @@ psql "$DATABASE_URL" -f migrations/0001_create_accounts_and_8_more.sql
 go run .                      # Prepare + Boot, then serve HTTP
 ```
 
-The comment at the top of its `main.go` has the full steps.
+[Its README](./examples/cli/README.md) has the full steps: Docker, a schema change, the draft file, and `migrate`. To run it with Docker, without Go or a local database:
+
+```bash
+cd examples/cli
+docker compose up --build     # PostgreSQL, the migration, then the server on :8080
+docker compose down -v        # stop, and drop the database
+```
 
 ## Supported databases
 

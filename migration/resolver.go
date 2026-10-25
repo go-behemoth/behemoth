@@ -135,6 +135,57 @@ func (p *FilePresenter) Collect(ctx context.Context) (map[string]int, error) {
 	return decisions, nil
 }
 
+// Consume implements [ResolutionConsumer]: it removes the entries of ids from
+// the draft file and keeps every other entry. A missing file has nothing to
+// remove.
+func (p *FilePresenter) Consume(ctx context.Context, ids []string) error {
+	draft, err := p.readDraft()
+	if err != nil {
+		return err
+	}
+	drop := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+	var kept []draftEntry // nil when nothing is left, as Present writes an empty draft
+	for _, e := range draft.Entries {
+		if !drop[e.ID] {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == len(draft.Entries) {
+		return nil
+	}
+	draft.Entries = kept
+	return p.writeDraft(draft)
+}
+
+// consumeAnswers removes from the draft the answers that the written
+// migration m used (ids, from ResolvedOperationSet.Consumed), and returns the
+// sentence the run's message ends with, or "" when nothing was removed.
+//
+// A draft belongs to one generation session (Draft lifecycle in the design
+// document). An issue's ID names only the artifact it is about, such as
+// alter_column_users_plan, so an answer left in the draft would be reused,
+// without a question, for the next change to that column. "Leave as-is"
+// answers are not in ids and stay: they produce no operation, and are how a
+// developer says not to ask again.
+//
+// It runs after the migration's files are written. A failure leaves them in
+// place and says which entries to remove by hand.
+func consumeAnswers(ctx context.Context, presenter ResolutionPresenter, ids []string, m Migration) (string, error) {
+	consumer, ok := presenter.(ResolutionConsumer)
+	if !ok || len(ids) == 0 {
+		return "", nil
+	}
+	if err := consumer.Consume(ctx, ids); err != nil {
+		return "", errs.NewMigrationError("Migration.ConsumeAnswers", errs.CodeMigrationDraftWriteFailed,
+			fmt.Errorf("migration %s was written, but the answers it used could not be removed from the draft. Remove %s from the draft by hand, or a later change to the same column reuses the answer: %w",
+				m.ID, strings.Join(ids, ", "), err))
+	}
+	return fmt.Sprintf(" The %d answer(s) it used were removed from the draft, so a later change to the same column is asked again.", len(ids)), nil
+}
+
 func (p *FilePresenter) readDraft() (draftFile, error) {
 	b, err := os.ReadFile(p.path)
 	if os.IsNotExist(err) {
@@ -198,7 +249,11 @@ func ResolveIssues(
 			unresolved = append(unresolved, issue.ID)
 			continue
 		}
-		resolved.Operations = append(resolved.Operations, issue.Options[idx].Operations...)
+		ops := issue.Options[idx].Operations
+		resolved.Operations = append(resolved.Operations, ops...)
+		if len(ops) > 0 && !slices.Contains(resolved.Consumed, issue.ID) {
+			resolved.Consumed = append(resolved.Consumed, issue.ID)
+		}
 	}
 	if len(unresolved) > 0 {
 		// Fail-closed — identical in both interactive and non-interactive

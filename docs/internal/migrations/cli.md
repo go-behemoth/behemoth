@@ -197,6 +197,8 @@ Planning writes each new question to `draft.json` with its default answer alread
 
 When a command fails with `unresolved_issues`, the command adds a line that names the draft file.
 
+A run that writes a migration removes from the draft the answers it used, those whose option produced operations, and core's message ends with a sentence that says so. `report` counts what is left, so that run's note leaves them out. See *Draft lifecycle* in the design document.
+
 ## Tests
 
 | Test | Covers |

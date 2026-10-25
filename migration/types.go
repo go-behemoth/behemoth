@@ -330,6 +330,12 @@ const (
 type ResolvedOperationSet struct {
 	Operations []SchemaOperation // no Tier, no Confirmed field needed here — those concepts don't exist past Resolution
 	Custom     []CustomMigration
+
+	// Consumed are the IDs of the issues whose chosen option produced
+	// operations. Once a migration made from this set is written, their
+	// answers are used up: see ResolutionConsumer. An answer that produced
+	// no operation ("Leave as-is") is not listed.
+	Consumed []string
 }
 
 type ResolutionPresenter interface {
@@ -339,4 +345,16 @@ type ResolutionPresenter interface {
 	Present(ctx context.Context, issues []PlanIssue, priorDecisions map[string]int) error
 	// Collect reads back developer decisions, keyed by PlanIssue.ID.
 	Collect(ctx context.Context) (decisions map[string]int, err error)
+}
+
+// ResolutionConsumer is a ResolutionPresenter that keeps answers between
+// runs and drops the ones a written migration used. A generate run that
+// writes a migration calls Consume with the IDs in
+// ResolvedOperationSet.Consumed, after the migration's files are written. A
+// later issue with the same ID, such as a second narrowing of the same
+// column, then starts again from its default instead of reusing the answer.
+//
+// FilePresenter implements it. A presenter that does not is left as it is.
+type ResolutionConsumer interface {
+	Consume(ctx context.Context, ids []string) error
 }

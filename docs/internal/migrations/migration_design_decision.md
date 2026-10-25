@@ -879,6 +879,15 @@ A confirmed decision whose option set changes is handled as follows:
 
 `[Convention, important]` A draft is scoped to a single generation session, not left to accumulate indefinitely. Once `Generate` successfully consumes a `ResolvedOperationSet` and freezes a `Migration`, the draft is consumed/archived, not left present for a future `generate` run to confusingly compare against, since the "previous" state has now moved forward and old resolved entries would no longer correspond to anything Planning could regenerate.
 
+How it is built (2026-10-24):
+
+- `ResolveIssues` lists in `ResolvedOperationSet.Consumed` the issues whose chosen option produced operations. After the migration's files are written, `consumeAnswers` passes them to the presenter's `Consume` (`ResolutionConsumer`, which `FilePresenter` implements), and the run's message says how many were removed. A preview removes nothing.
+- "Leave as-is" answers stay. They produce no operation, and the convention above makes them the way to say "don't ask again". Every issue's default is "Leave as-is", so a kept answer, or a question that starts over, never changes the database.
+- Why it matters: an issue's ID names only its artifact (`alter_column_users_plan`). Before this, an "Apply alter" answer stayed in the draft until a run in which the issue was absent, and a second narrowing of the same column, with no run in between, was altered without a question.
+- `[Limit]` If a written migration is deleted before it is applied and generated again, its questions come back with their defaults and have to be answered again.
+- `[Limit]` A kept "Leave as-is" answer also answers a later, different change to the same column. It changes nothing, but the developer is not told that the change differs. Storing a fingerprint of the divergence with each answer would flag it.
+- The migration's files are written first. If `Consume` fails, the run returns `draft_write_failed` with the IDs to remove by hand, and the files stay.
+
 #### Output
 
 `ResolvedOperationSet`, as defined in the Generate-stage manifesto. Every operation present is either auto-tiered (never required a decision) or was explicitly resolved by a human through this stage. `[Convention]` `Generate`'s function signature accepts only this type, never `MigrationPlan` or raw `PlanIssue` data, making it a compile-time error (not merely a documented expectation) to wire the pipeline in a way that bypasses Resolution.

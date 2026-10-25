@@ -148,7 +148,7 @@ func RunManagedGenerate(
 // own review (renames, narrowing alters) runs inside it, through the draft
 // file.
 func generateNext(ctx context.Context, cfg MigrationConfig, declared Declared, deps MigrationDeps, confirmWrite bool) (*RunResult, error) {
-	m, err := buildMigrationPlan(ctx, cfg, declared, deps.GenerateDeps, true)
+	m, consumed, err := buildMigrationPlan(ctx, cfg, declared, deps.GenerateDeps, true)
 	if err != nil {
 		if errs.IsCode(err, errs.CodeMigrationNothingToGenerate) {
 			return &RunResult{Status: StatusNoChanges, Message: "No schema changes detected."}, nil
@@ -163,8 +163,12 @@ func generateNext(ctx context.Context, cfg MigrationConfig, declared Declared, d
 	if err != nil {
 		return nil, err
 	}
+	used, err := consumeAnswers(ctx, deps.GenerateDeps.Presenter, consumed, *m)
+	if err != nil {
+		return nil, err
+	}
 	return &RunResult{Status: StatusGenerated, Migration: m,
-		Message: fmt.Sprintf("Migration %s written to %s. Review it, then run migrate to apply it.", m.ID, written)}, nil
+		Message: fmt.Sprintf("Migration %s written to %s. Review it, then run migrate to apply it.", m.ID, written) + used}, nil
 }
 
 // writeForReview writes m and, when the driver renders, its script next to

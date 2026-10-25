@@ -25,7 +25,7 @@ func RunGenerateCLI(ctx context.Context, cfg MigrationConfig, declared Declared,
 	if err := checkPath("Migration.RunGenerateCLI", cfg, PathGenerateOnly); err != nil {
 		return nil, err
 	}
-	m, err := buildMigrationPlan(ctx, cfg, declared, deps, true)
+	m, consumed, err := buildMigrationPlan(ctx, cfg, declared, deps, true)
 	if err != nil {
 		if errs.IsCode(err, errs.CodeMigrationNothingToGenerate) {
 			return &RunResult{Status: StatusNoChanges, Message: "No schema changes detected."}, nil
@@ -53,6 +53,10 @@ func RunGenerateCLI(ctx context.Context, cfg MigrationConfig, declared Declared,
 	if err := ddl.write(cfg, *m); err != nil {
 		return nil, err
 	}
+	used, err := consumeAnswers(ctx, deps.Presenter, consumed, *m)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := fmt.Sprintf("Migration %s written to %s. Hand off to your own migration tool for application.", m.ID, migrationFilePath(cfg, *m))
 	if ddl != nil {
@@ -62,7 +66,7 @@ func RunGenerateCLI(ctx context.Context, cfg MigrationConfig, declared Declared,
 	return &RunResult{
 		Status:    StatusGenerated,
 		Migration: m,
-		Message:   msg,
+		Message:   msg + used,
 	}, nil
 
 }
