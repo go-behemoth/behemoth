@@ -103,6 +103,9 @@ Each flow that requires a caller requires a permission. A signed-in user holds e
 | `email:change` | self, with a fresh session | `emailverification.Plugin.RequestChange` |
 | `session_token:issue` | self, with a session | `core.SessionTokens.Issue` |
 | `phone:change` | self, when the caller acts for a user | `phonenumber.Plugin.SendCode`, `phonenumber.Plugin.Verify` |
+| `oauth_account:read` | self | `oauth.Plugin.Accounts` |
+| `oauth_account:manage` | self, with a fresh session to start a link and to unlink | `oauth.Plugin.BeginLink`, `oauth.Plugin.Unlink`, and `oauth.Plugin.Complete` for a link |
+| `oauth_token:read` | self | `oauth.Plugin.AccessToken` |
 | `user:set_password` | admin | `emailpassword.Plugin.SetPassword` |
 | `user:set_username` | admin | `username.Plugin.SetUsername` |
 | `user:set_phone` | admin | `phonenumber.Plugin.SetPhoneNumber` |

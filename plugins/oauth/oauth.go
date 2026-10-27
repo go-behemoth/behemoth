@@ -12,18 +12,30 @@
 // user it creates, so a handler written for another plugin's sign-ins sees
 // these too.
 //
-// The two routes, POST /sign-in/oauth and POST /oauth/complete, are JSON
-// calls of the application's own pages. The binding value travels the way
-// the session token does: in an HttpOnly cookie under the cookie
-// deliveries, and in the response body for a client that keeps the session
-// token itself.
+// A signed-in user can also link a provider account to their own account,
+// so that the provider signs them in too. BeginLink starts a link the way
+// Begin starts a sign-in, and Complete finishes it: the provider account
+// is attached to the user who started the link, in the session that
+// started it, and no session is created. Unlink removes a provider
+// account, unless it is the user's last way to sign in, and Accounts lists
+// them. A first sign-in whose email belongs to a user is refused, unless
+// the provider is in Options.LinkByVerifiedEmail and both sides verified
+// the email.
+//
+// For a provider in Options.StoreTokens, the plugin keeps the provider's
+// tokens, sealed, in the user's account. AccessToken hands the application
+// a valid access token, to call the provider for the user, and refreshes
+// it when it expired. Unlink revokes the tokens at the provider.
+//
+// The routes, POST /sign-in/oauth, POST /oauth/link and POST
+// /oauth/complete, are JSON calls of the application's own pages. The
+// binding value travels the way the session token does: in an HttpOnly
+// cookie under the cookie deliveries, and in the response body for a
+// client that keeps the session token itself.
 //
 // Three kinds of provider ship with the plugin and are configured as data
 // (ProviderConfig): any OpenID Connect provider, Google, and GitHub. An
 // application can add a Provider of its own.
-//
-// Experimental: the plugin is not complete. There is no linking of a
-// provider account to an existing user, and no stored provider token.
 package oauth
 
 import (
@@ -42,6 +54,7 @@ import (
 	"github.com/go-behemoth/behemoth/models"
 	"github.com/go-behemoth/behemoth/outbound"
 	"github.com/go-behemoth/behemoth/telemetry"
+	"golang.org/x/sync/singleflight"
 )
 
 // PluginName is the name the plugin registers under (PluginMeta.Name). It
@@ -68,6 +81,46 @@ const (
 	// HookBeginFailed fires for a sign-in that a handler or a rate limit
 	// refused to start: code "rejected_by_hook".
 	HookBeginFailed core.HookPoint = "auth.oauth.beginFailed"
+)
+
+// The points the plugin declares and fires around a link and an unlink.
+// The after and failed points are audited: each changes how a user can
+// sign in.
+const (
+	// HookLinkBefore runs before a provider account is linked, with the
+	// payload "userID", "provider" and "by" (LinkedByUser or
+	// LinkedByVerifiedEmail). Veto only. For a link the user started, it
+	// runs before the callback is checked.
+	HookLinkBefore core.HookPoint = "auth.oauth.beforeLink"
+	// HookLinkAfter runs once a provider account is linked, with a
+	// *LinkResult.
+	HookLinkAfter core.HookPoint = "auth.oauth.afterLink"
+	// HookLinkFailed fires for a link that was refused. The metadata has the
+	// provider.
+	HookLinkFailed core.HookPoint = "auth.oauth.linkFailed"
+	// HookUnlinkBefore runs before a provider account is removed, with the
+	// payload "userID" and "provider". Veto only.
+	HookUnlinkBefore core.HookPoint = "auth.oauth.beforeUnlink"
+	// HookUnlinkAfter runs once a provider account is removed, with an
+	// *UnlinkResult.
+	HookUnlinkAfter core.HookPoint = "auth.oauth.afterUnlink"
+	// HookUnlinkFailed fires for an unlink that was refused. The metadata
+	// has the provider.
+	HookUnlinkFailed core.HookPoint = "auth.oauth.unlinkFailed"
+)
+
+// The permissions of the flows on a user's provider accounts. Each is a
+// self-service permission: the flows act on the caller's own account.
+const (
+	// PermissionRead is the permission Accounts requires: listing the
+	// caller's provider accounts.
+	PermissionRead core.Permission = "oauth_account:read"
+	// PermissionManage is the permission BeginLink and Unlink require, with
+	// a fresh session, and the completion of a link requires.
+	PermissionManage core.Permission = "oauth_account:manage"
+	// PermissionAccessToken is the permission AccessToken requires: reading
+	// the access token of one of the caller's provider accounts.
+	PermissionAccessToken core.Permission = "oauth_token:read"
 )
 
 // providerID is the form of a provider's id. The length is that of the
@@ -109,20 +162,66 @@ type Options struct {
 	// TokenConfig.TTLOverrides for core.TokenKindOAuthState takes
 	// precedence.
 	StateTTL time.Duration
+
+	// LinkByVerifiedEmail lists the ids of the providers whose first
+	// sign-in may link to an existing user by email. When such a provider
+	// names a subject that has no account, and a user has the provider's
+	// email, Complete links the subject to that user and signs the user in.
+	// It does so only when the provider says it verified the email, the
+	// user's own email_verified is true, and the user has no account at
+	// the provider yet. Otherwise, and for every provider not listed, the
+	// sign-in is refused with ErrorCodeAccountNotLinked, and the user links
+	// the provider from a signed-in session (BeginLink). Empty by default.
+	//
+	// A listed provider can sign in to every account whose email it
+	// reports as verified, so an account is as safe as the weakest listed
+	// provider. List only a provider that verifies the addresses it
+	// reports, for the users it reports them for.
+	LinkByVerifiedEmail []string
+
+	// StoreTokens lists the ids of the providers whose tokens the plugin
+	// keeps in the user's account: the access token, the refresh token, the
+	// ID token, when they expire, and the scope the provider granted. The
+	// tokens are sealed in the accounts table. AccessToken then returns a
+	// valid access token for the user, and refreshes it when it expired,
+	// and Unlink revokes the tokens at the provider. Empty by default: the
+	// plugin discards a provider's tokens once the provider has named the
+	// user.
+	//
+	// Each sign-in and link replaces the account's tokens with the ones the
+	// provider just issued, and keeps a refresh token the provider did not
+	// issue again. A sign-in with a provider that is not listed removes the
+	// tokens its account holds.
+	//
+	// With its tokens stored, a Google provider asks for offline access,
+	// without which Google issues no refresh token. Another OpenID Connect
+	// provider usually needs the scope "offline_access" in
+	// ProviderConfig.Scopes for one.
+	StoreTokens []string
 }
 
 // Plugin is the OAuth sign-in plugin. It declares the oauth_state token
-// kind and the auth.oauth.* points around Begin, and fires core's
-// auth.signIn.* and auth.signUp.* points when a sign-in is completed. It
-// needs no table of its own: a started sign-in is a row in core's tokens
-// table, and a provider account is a row in accounts.
+// kind, the auth.oauth.* points around Begin, a link, and an unlink, and
+// fires core's auth.signIn.* and auth.signUp.* points when a sign-in is
+// completed. It needs no table of its own: a started sign-in is a row in
+// core's tokens table, and a provider account is a row in accounts.
 type Plugin struct {
 	opts        Options
 	providers   map[string]Provider
 	authContext *core.AuthContext
 	log         telemetry.Logger
-	complete    func(hctx *core.HookContext, in completeInput) (*core.SignInResult, error)
-	signUp      func(hctx *core.HookContext, in signUpInput) (*models.User, error)
+	// linkByEmail holds the ids of Options.LinkByVerifiedEmail, and
+	// storeTokens those of Options.StoreTokens.
+	linkByEmail map[string]bool
+	storeTokens map[string]bool
+	// refreshes makes the AccessToken calls for one account that find its
+	// access token expired share one refresh, within this process.
+	refreshes    singleflight.Group
+	complete     func(hctx *core.HookContext, in completeInput) (*core.SignInResult, error)
+	signUp       func(hctx *core.HookContext, in signUpInput) (*models.User, error)
+	completeLink func(hctx *core.HookContext, in linkCompletion) (*LinkResult, error)
+	autoLink     func(hctx *core.HookContext, in autoLinkInput) (*LinkResult, error)
+	unlink       func(hctx *core.HookContext, in unlinkInput) (*UnlinkResult, error)
 }
 
 // New returns the plugin configured with opts. Values left at zero take
@@ -157,10 +256,15 @@ func (p *Plugin) Version() string {
 // Declare implements [core.Plugin]. The plugin declares:
 //   - the token kind core.TokenKindOAuthState: single use, and kept in the
 //     database, so that the plugin works without a key-value storage;
-//   - the auth.oauth.* points around Begin. None is audited: Begin needs no
-//     session and is not about an account;
-//   - a rate-limit rule: starts of a sign-in per client address. A
-//     completion is a sign-in, which core's rule per address counts.
+//   - the permissions PermissionRead, PermissionManage, and
+//     PermissionAccessToken;
+//   - the auth.oauth.* points around Begin, none of them audited: Begin
+//     needs no session, and a start changes no account;
+//   - the auth.oauth.* points around a link and an unlink, whose after and
+//     failed points are audited;
+//   - a rate-limit rule: starts of a sign-in or a link per client address.
+//     A completion of a sign-in is a sign-in, which core's rule per
+//     address counts.
 //
 // It declares no sign-in points: core declares auth.signIn.* and
 // auth.signUp.*.
@@ -170,10 +274,25 @@ func (p *Plugin) Declare(ic *core.PluginInitContext) error {
 	}); err != nil {
 		return err
 	}
+	for _, def := range []core.PermissionDef{
+		{Name: PermissionRead, Kind: core.PermissionSelf, Description: "See the provider accounts linked to your account"},
+		{Name: PermissionManage, Kind: core.PermissionSelf, Description: "Link provider accounts to your account, and unlink them"},
+		{Name: PermissionAccessToken, Kind: core.PermissionSelf, Description: "Use the access tokens of your provider accounts, to call a provider for you"},
+	} {
+		if err := ic.Permissions.Declare(def); err != nil {
+			return err
+		}
+	}
 	for _, def := range []core.HookPointDef{
 		{Point: HookBeginBefore, Phase: core.BeforeHookPhase},
 		{Point: HookBeginAfter, Phase: core.AfterHookPhase},
 		{Point: HookBeginFailed, Phase: core.FailedHookPhase},
+		{Point: HookLinkBefore, Phase: core.BeforeHookPhase},
+		{Point: HookLinkAfter, Phase: core.AfterHookPhase, Audit: &core.AuditSpec{}},
+		{Point: HookLinkFailed, Phase: core.FailedHookPhase, Audit: &core.AuditSpec{}},
+		{Point: HookUnlinkBefore, Phase: core.BeforeHookPhase},
+		{Point: HookUnlinkAfter, Phase: core.AfterHookPhase, Audit: &core.AuditSpec{}},
+		{Point: HookUnlinkFailed, Phase: core.FailedHookPhase, Audit: &core.AuditSpec{}},
 	} {
 		if err := ic.Hooks.Declare(def); err != nil {
 			return err
@@ -183,6 +302,7 @@ func (p *Plugin) Declare(ic *core.PluginInitContext) error {
 	// Per client address on Begin's before point, like the magic link
 	// plugin's: it slows one client down and can't be used to keep another
 	// one out. Begin needs no session and writes a token for every call.
+	// BeginLink fires the same point, so starts of a link count here too.
 	return ic.RateLimits.DeclareHookRateLimitRule(core.HookRateLimitRule{
 		Name: RuleBeginAddress, Point: HookBeginBefore,
 		KeyFunc: core.KeyByClientIP(), Limit: core.Limit{Max: 10, Window: time.Minute},
@@ -204,9 +324,11 @@ func (p *Plugin) Middlewares() []httpapi.Middleware {
 // built-in providers, keeps the AuthContext and wraps the flows with their
 // hook points. A missing provider, a ProviderConfig that is incomplete or
 // whose client secret can't be read, a provider id that is malformed,
-// reserved or used twice, and a CallbackURL that is not usable are
-// configuration errors. Init calls no provider: a provider that is down
-// fails the sign-ins, not the boot.
+// reserved or used twice, a CallbackURL that is not usable, and an id in
+// LinkByVerifiedEmail or StoreTokens that names no provider are
+// configuration errors.
+// Init calls no provider: a provider that is down fails the sign-ins, not
+// the boot.
 func (p *Plugin) Init(ac *core.AuthContext) error {
 	const op = "oauth.Init"
 	if p.opts.StateTTL < 0 {
@@ -233,10 +355,16 @@ func (p *Plugin) Init(ac *core.AuthContext) error {
 		at       string
 		provider Provider
 	}
+	// A provider's settings can depend on whether its tokens are kept, so
+	// the set comes first. Its ids are checked once the providers exist.
+	storeTokens := make(map[string]bool, len(p.opts.StoreTokens))
+	for _, id := range p.opts.StoreTokens {
+		storeTokens[id] = true
+	}
 	all := make([]placed, 0, len(p.opts.Providers)+len(p.opts.CustomProviders))
 	for i, cfg := range p.opts.Providers {
 		at := fmt.Sprintf("Options.Providers[%d]", i)
-		provider, err := newBuiltinProvider(at, cfg, client, time.Now)
+		provider, err := newBuiltinProvider(at, cfg, client, time.Now, storeTokens)
 		if err != nil {
 			return errs.NewConfigurationError(op, err.Error(), nil)
 		}
@@ -263,8 +391,22 @@ func (p *Plugin) Init(ac *core.AuthContext) error {
 		}
 		providers[id] = entry.provider
 	}
+	linkByEmail := make(map[string]bool, len(p.opts.LinkByVerifiedEmail))
+	for i, id := range p.opts.LinkByVerifiedEmail {
+		if providers[id] == nil {
+			return errs.NewConfigurationError(op, fmt.Sprintf("Options.LinkByVerifiedEmail[%d] is %q, which is the id of no provider", i, id), nil)
+		}
+		linkByEmail[id] = true
+	}
+	for i, id := range p.opts.StoreTokens {
+		if providers[id] == nil {
+			return errs.NewConfigurationError(op, fmt.Sprintf("Options.StoreTokens[%d] is %q, which is the id of no provider", i, id), nil)
+		}
+	}
 
 	p.providers = providers
+	p.linkByEmail = linkByEmail
+	p.storeTokens = storeTokens
 	p.authContext = ac
 	p.log = telemetry.NoOpLogger{}
 	if ac.Telemetry != nil {
@@ -272,6 +414,20 @@ func (p *Plugin) Init(ac *core.AuthContext) error {
 	}
 	p.complete = core.WithLifecycle(ac.Dispatcher, hooks.HookSignInBefore, hooks.HookSignInAfter, hooks.HookSignInFailed, p.completeBody)
 	p.signUp = core.WithLifecycle(ac.Dispatcher, hooks.HookSignUpBefore, hooks.HookSignUpAfter, hooks.HookSignUpFailed, p.signUpBody)
+	// Both ways to link fire the same points, so a handler and the audit
+	// log see every link, whichever way it was made.
+	p.completeLink = core.WithLifecycle(ac.Dispatcher, HookLinkBefore, HookLinkAfter, HookLinkFailed, p.completeLinkBody)
+	p.autoLink = core.WithLifecycle(ac.Dispatcher, HookLinkBefore, HookLinkAfter, HookLinkFailed, p.autoLinkBody)
+	p.unlink = core.WithLifecycle(ac.Dispatcher, HookUnlinkBefore, HookUnlinkAfter, HookUnlinkFailed, p.unlinkBody)
+	return nil
+}
+
+// ready reports a configuration error when Boot has not initialized the
+// plugin. A flow that asks Access about the caller calls it first.
+func (p *Plugin) ready(op string) error {
+	if p.authContext == nil {
+		return errs.NewConfigurationError(op, "the plugin is not initialized; pass it to Prepare and Boot first", nil)
+	}
 	return nil
 }
 
@@ -279,8 +435,8 @@ func (p *Plugin) Init(ac *core.AuthContext) error {
 // as a copy of the operation ctx already belongs to, if any, and Request is
 // the request ctx carries, or nil.
 func (p *Plugin) operation(ctx context.Context, op string) (*core.HookContext, error) {
-	if p.authContext == nil {
-		return nil, errs.NewConfigurationError(op, "the plugin is not initialized; pass it to Prepare and Boot first", nil)
+	if err := p.ready(op); err != nil {
+		return nil, err
 	}
 	return &core.HookContext{
 		Ctx:    ctx,
@@ -289,11 +445,15 @@ func (p *Plugin) operation(ctx context.Context, op string) (*core.HookContext, e
 	}, nil
 }
 
-// Routes implements [httpapi.Plugin].
+// Routes implements [httpapi.Plugin]. The routes on the caller's provider
+// accounts have no session middleware: each flow reads the caller itself.
 func (p *Plugin) Routes() []httpapi.Route {
 	return []httpapi.Route{
 		{Method: http.MethodPost, Path: PathBegin, Handler: p.handleBegin},
+		{Method: http.MethodPost, Path: PathLink, Handler: p.handleLink},
 		{Method: http.MethodPost, Path: PathComplete, Handler: p.handleComplete},
+		{Method: http.MethodPost, Path: PathUnlink, Handler: p.handleUnlink},
+		{Method: http.MethodGet, Path: PathAccounts, Handler: p.handleAccounts},
 	}
 }
 

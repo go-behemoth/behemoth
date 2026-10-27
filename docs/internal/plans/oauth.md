@@ -2,7 +2,7 @@
 
 This document describes the design for signing a user in through an OAuth 2.0 or OpenID Connect provider. It covers the components, the threats and their controls, how a provider account is linked to a user, and the decisions taken so far.
 
-**Status:** in progress, as of 2026-10-14. The package is `plugins/oauth`. [Implementation steps](#implementation-steps) lists what is built.
+**Status:** built, as of 2026-10-26. Every step is done. The package is `plugins/oauth`, and [`../plugins/oauth.md`](../plugins/oauth.md) describes what is built. [Implementation steps](#implementation-steps) lists the work, and [`../../api/oauth.md`](../../api/oauth.md) describes the result for an application.
 
 The documents it builds on are:
 
@@ -157,9 +157,13 @@ With storage turned on, the tokens go into the sealed columns of `accounts`, and
 - hand the application a valid access token through a flow
 - revoke the tokens at the provider when the account is unlinked
 
+[`../plugins/oauth.md`](../plugins/oauth.md#provider-tokens) describes how step 6 built them. The option lists provider ids, the access token is refreshed when the flow asks for it, the flow has no route, and an unlink revokes the tokens once the account is removed.
+
 ### Account routes
 
 Three routes let a signed-in user manage provider accounts: link, unlink, and list. Each requires a session. Unlink refuses to remove the last way the user can sign in.
+
+[`../plugins/oauth.md`](../plugins/oauth.md#linking) describes how step 5 built them. A link starts at its own route and completes through `Complete`, like a sign-in. A user has one account per provider, and unlink counts a password and the accounts at the configured providers as ways to sign in.
 
 ## Sign-in sequence
 
@@ -336,9 +340,9 @@ The plugin is built in this order. Each step ends with its tests and its docs.
 | 2 | `Complete` for a sign-in: the binding check, the exchange, identity resolution, and the session | Done |
 | 3 | The two routes, their rate-limit rules, and the delivery of the binding value | Done |
 | 4 | The built-in providers: the shared protocol implementation, generic OpenID Connect, Google, and GitHub | Done |
-| 5 | Linking: the link intent in `Begin` and `Complete`, the option that links by a verified email, and the link, unlink, and list routes | Not started |
-| 6 | Stored provider tokens: the option, refresh, a flow that returns a valid access token, and revocation | Not started |
-| 7 | The example application, the README, and the API page's move out of experimental. The API page exists since step 3. | Not started |
+| 5 | Linking: the link intent in `Begin` and `Complete`, the option that links by a verified email, and the link, unlink, and list routes | Done |
+| 6 | Stored provider tokens: the option, refresh, a flow that returns a valid access token, and revocation | Done |
+| 7 | The example application, the README, and the API page's move out of experimental. The API page exists since step 3. | Done |
 
 ## Related entries
 

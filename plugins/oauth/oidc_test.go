@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -214,6 +215,9 @@ func TestOIDCDiscoveryChecks(t *testing.T) {
 		"a token endpoint over http":    func(doc map[string]any) { doc["token_endpoint"] = "http://token.example.com/token" },
 		"no key set":                    func(doc map[string]any) { delete(doc, "jwks_uri") },
 		"a userinfo endpoint over http": func(doc map[string]any) { doc["userinfo_endpoint"] = "http://info.example.com" },
+		"a revocation endpoint over http": func(doc map[string]any) {
+			doc["revocation_endpoint"] = "http://revoke.example.com"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			iss := newTestIssuer(t)
@@ -438,4 +442,131 @@ func TestSigningAlgsAreAsymmetric(t *testing.T) {
 	for _, alg := range signingAlgs {
 		assert.False(t, strings.HasPrefix(alg, "HS") || strings.EqualFold(alg, "none"), alg)
 	}
+}
+
+// An exchange returns the provider's tokens with their lifetimes, and the
+// ID token it checked. An answer without a scope grants the one asked for.
+func TestOIDCExchangeTokens(t *testing.T) {
+	clock := &testClock{at: time.Now()}
+	iss := newTestIssuer(t)
+	p := iss.provider(clock)
+	idToken := sign(t, jwt.SigningMethodRS256, iss.key, "k1", iss.claims(testNonce, clock.now()))
+	iss.set(func(iss *testIssuer) {
+		iss.token = func(url.Values) (int, any) {
+			return http.StatusOK, map[string]any{
+				"access_token": "access-1", "token_type": "Bearer", "id_token": idToken,
+				"refresh_token": "refresh-1", "expires_in": 3600, "scope": "openid email",
+			}
+		}
+	})
+	result, err := exchange(p, testNonce)
+	require.NoError(t, err)
+	assert.Equal(t, Tokens{
+		AccessToken: "access-1", RefreshToken: "refresh-1", IDToken: idToken,
+		ExpiresAt: clock.now().Add(time.Hour), Scope: "openid email",
+	}, result.Tokens)
+
+	iss.answerWith(idToken)
+	result, err = exchange(p, testNonce)
+	require.NoError(t, err)
+	assert.Equal(t, "openid email profile", result.Tokens.Scope)
+	assert.True(t, result.Tokens.ExpiresAt.IsZero(), "no expires_in, no expiry")
+	assert.Empty(t, result.Tokens.RefreshToken)
+}
+
+// A refresh posts the refresh token to the token endpoint, authenticated as
+// the code exchange is. An ID token in the answer is dropped. A refresh
+// token the issuer refuses wraps ErrExchangeRefused, and an issuer that
+// fails does not.
+func TestOIDCRefresh(t *testing.T) {
+	clock := &testClock{at: time.Now()}
+	iss := newTestIssuer(t)
+	p := iss.provider(clock)
+	iss.set(func(iss *testIssuer) {
+		iss.token = func(url.Values) (int, any) {
+			return http.StatusOK, map[string]any{"access_token": "access-2", "id_token": "not-checked", "expires_in": "3600"}
+		}
+	})
+	tokens, err := p.Refresh(context.Background(), RefreshRequest{RefreshToken: "refresh-1"})
+	require.NoError(t, err)
+	assert.Equal(t, &Tokens{AccessToken: "access-2", ExpiresAt: clock.now().Add(time.Hour)}, tokens,
+		"no refresh token: the issuer keeps the old one; no scope: it did not change")
+	token := iss.last(t, "/token")
+	assert.Equal(t, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"refresh-1"}}, token.form)
+	assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("client-1:s3cret")), token.header.Get("Authorization"))
+
+	for status, refused := range map[int]bool{http.StatusBadRequest: true, http.StatusInternalServerError: false} {
+		iss.set(func(iss *testIssuer) {
+			iss.token = func(url.Values) (int, any) {
+				if refused {
+					return status, map[string]any{"error": "invalid_grant"}
+				}
+				return status, map[string]any{}
+			}
+		})
+		_, err := p.Refresh(context.Background(), RefreshRequest{RefreshToken: "refresh-1"})
+		require.Error(t, err)
+		assert.Equal(t, refused, errors.Is(err, ErrExchangeRefused), "status %d: %v", status, err)
+	}
+}
+
+// Revoking sends the refresh token, or the access token when there is none,
+// to the revocation endpoint (RFC 7009). An issuer without one revokes
+// nothing, and an endpoint that fails is an error.
+func TestOIDCRevoke(t *testing.T) {
+	clock := &testClock{at: time.Now()}
+	iss := newTestIssuer(t)
+	iss.set(func(iss *testIssuer) {
+		iss.doc["revocation_endpoint"] = iss.srv.URL + "/revoke"
+		iss.doc["revocation_endpoint_auth_methods_supported"] = []string{"client_secret_post"}
+	})
+	p := iss.provider(clock)
+
+	require.NoError(t, p.Revoke(context.Background(), Tokens{AccessToken: "access-1", RefreshToken: "refresh-1"}))
+	assert.Equal(t, url.Values{
+		"token": {"refresh-1"}, "token_type_hint": {"refresh_token"}, "client_id": {"client-1"}, "client_secret": {"s3cret"},
+	}, iss.last(t, "/revoke").form)
+	require.NoError(t, p.Revoke(context.Background(), Tokens{AccessToken: "access-1"}))
+	assert.Equal(t, "access_token", iss.last(t, "/revoke").form.Get("token_type_hint"))
+
+	iss.set(func(iss *testIssuer) { iss.revoke = func(url.Values) int { return http.StatusServiceUnavailable } })
+	assert.Error(t, p.Revoke(context.Background(), Tokens{AccessToken: "access-1"}))
+	require.NoError(t, p.Revoke(context.Background(), Tokens{}), "nothing to revoke")
+	assert.Equal(t, 3, iss.count("/revoke"))
+
+	without := newTestIssuer(t)
+	require.NoError(t, without.provider(clock).Revoke(context.Background(), Tokens{AccessToken: "access-1"}))
+	assert.Zero(t, without.count("/revoke"), "an issuer without a revocation endpoint")
+}
+
+// Parameters of a provider's own join the authorization URL, and can't
+// replace one of the protocol's.
+func TestOIDCExtraAuthorizationParams(t *testing.T) {
+	iss := newTestIssuer(t)
+	p := iss.provider(&testClock{at: time.Now()})
+	p.authParams = url.Values{"access_type": {"offline"}, "state": {"evil"}}
+	raw, err := p.AuthorizationURL(context.Background(), AuthorizationRequest{State: "state-1", Nonce: testNonce})
+	require.NoError(t, err)
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "offline", u.Query().Get("access_type"))
+	assert.Equal(t, []string{"state-1"}, u.Query()["state"])
+}
+
+// A lifetime is a number or a string of digits. Anything else, a negative
+// one, and one past an int32 of seconds read as unknown, without failing the
+// answer.
+func TestTokenLifetimes(t *testing.T) {
+	for raw, want := range map[string]seconds{
+		`3600`: 3600, `"3600"`: 3600, `null`: 0, `"soon"`: 0, `-5`: 0, `1.5`: 0, `99999999999`: 0,
+	} {
+		var answer tokenResponse
+		require.NoError(t, json.Unmarshal([]byte(`{"access_token":"a","expires_in":`+raw+`}`), &answer), raw)
+		assert.Equal(t, want, answer.ExpiresIn, raw)
+	}
+
+	now := time.Now()
+	tokens := (&tokenResponse{AccessToken: "a", ExpiresIn: 60, RefreshTokenExpiresIn: 120}).tokens(now)
+	assert.Equal(t, now.Add(time.Minute), tokens.ExpiresAt)
+	assert.True(t, tokens.RefreshExpiresAt.IsZero(), "a lifetime of a refresh token that was not issued")
 }

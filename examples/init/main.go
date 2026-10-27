@@ -8,6 +8,8 @@
 //	                            # Prepare + Boot, then sign up and sign in without HTTP
 //	go run . audit [-email ada@example.com] [-n 20]
 //	                            # print the newest audit events, or those about one user
+//	go run . oauth-token -email ada@example.com [-provider github]
+//	                            # a valid access token of the user at a provider
 //
 // DATABASE_URL defaults to postgres://postgres:postgres@localhost:5432/behemoth?sslmode=disable
 //
@@ -51,6 +53,37 @@
 //
 // APP_URL is the address the links point to (default http://localhost:8080).
 //
+// # Sign-in with a provider
+//
+// With a provider's credentials in the environment, the example adds the
+// OAuth plugin (oauth.go). Register an application at the provider, with
+// <APP_URL>/auth/callback/<provider id> as its redirect URI, then:
+//
+//	GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... go run . serve
+//
+// For GitHub the redirect URI is http://localhost:8080/auth/callback/github.
+// GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET add Google, and OIDC_ISSUER,
+// OIDC_CLIENT_ID and OIDC_CLIENT_SECRET any OpenID Connect provider, such as
+// a local Keycloak, under the id "oidc". Without any of them the example
+// runs as before.
+//
+// Open http://localhost:8080/auth/oauth (pages.go). "Sign in with github"
+// sends the browser to GitHub, which sends it back to the callback page, and
+// that page finishes the sign-in: the first one creates the user from
+// GitHub's profile. A first sign-in whose email belongs to a user is
+// refused. That user signs in by password, pastes the session token into
+// the page, and links GitHub: "Link github" goes through GitHub the same
+// way, and attaches the GitHub account to the signed-in user. The page also
+// lists and unlinks the user's provider accounts. An unlink keeps the last
+// way to sign in, so a user without a password can't unlink their only
+// provider.
+//
+// The example keeps the providers' tokens. The oauth-token command shows
+// what the application's server gets to call the provider's API for a user,
+// refreshed when it expired:
+//
+//	go run . oauth-token -email ada@example.com -provider github
+//
 // # Telemetry
 //
 // telemetry.go wires behemoth's logs, audit events, metrics and traces.
@@ -85,7 +118,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: init <migrate [-confirm] | serve | signup -email E -password P [-invite CODE] | audit [-email E] [-n N]>")
+		fmt.Fprintln(os.Stderr, "usage: init <migrate [-confirm] | serve | signup -email E -password P [-invite CODE] | audit [-email E] [-n N] | oauth-token -email E [-provider P]>")
 		os.Exit(2)
 	}
 	ctx := context.Background()
@@ -112,6 +145,12 @@ func main() {
 		limit := fs.Int("n", 20, "how many events to print")
 		fs.Parse(args)
 		err = audit(ctx, *email, *limit)
+	case "oauth-token":
+		fs := flag.NewFlagSet("oauth-token", flag.ExitOnError)
+		email := fs.String("email", "", "the user's email address")
+		provider := fs.String("provider", "github", "the provider's id")
+		fs.Parse(args)
+		err = oauthToken(ctx, *email, *provider)
 	default:
 		err = fmt.Errorf("unknown command %q", cmd)
 	}

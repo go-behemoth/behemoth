@@ -31,18 +31,25 @@ import (
 
 // fakeProvider is a Provider that keeps what the flows handed it. For Begin
 // it answers with a URL that carries all of it, or with err, or with url.
-// For Complete it answers with identity, or with exchangeErr.
+// For Complete it answers with identity and tokens, or with exchangeErr. It
+// refreshes with refresh, which a test sets before a refresh is due, and
+// revokes by keeping the tokens, answering revokeErr.
 type fakeProvider struct {
 	id  string
 	err error
 	url string
 
 	identity    oauth.Identity
+	tokens      oauth.Tokens
 	exchangeErr error
+	refresh     func(refreshToken string) (*oauth.Tokens, error)
+	revokeErr   error
 
 	mu        sync.Mutex
 	seen      []oauth.AuthorizationRequest
 	exchanged []oauth.ExchangeRequest
+	refreshed []string
+	revoked   []oauth.Tokens
 }
 
 func (f *fakeProvider) ID() string { return f.id }
@@ -71,7 +78,32 @@ func (f *fakeProvider) Exchange(_ context.Context, req oauth.ExchangeRequest) (*
 	if f.exchangeErr != nil {
 		return nil, f.exchangeErr
 	}
-	return &oauth.ExchangeResult{Identity: f.identity}, nil
+	return &oauth.ExchangeResult{Identity: f.identity, Tokens: f.tokens}, nil
+}
+
+func (f *fakeProvider) Refresh(_ context.Context, req oauth.RefreshRequest) (*oauth.Tokens, error) {
+	f.mu.Lock()
+	f.refreshed = append(f.refreshed, req.RefreshToken)
+	refresh := f.refresh
+	f.mu.Unlock()
+	if refresh == nil {
+		return nil, errors.New("the test did not expect a refresh")
+	}
+	return refresh(req.RefreshToken)
+}
+
+func (f *fakeProvider) Revoke(_ context.Context, tokens oauth.Tokens) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, tokens)
+	return f.revokeErr
+}
+
+// refreshes is how often the provider was asked to refresh a token.
+func (f *fakeProvider) refreshes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.refreshed)
 }
 
 // exchanges is how often the provider was asked to redeem a code.
@@ -179,6 +211,7 @@ func TestOAuthBeginStartsASignIn(t *testing.T) {
 	result, err := app.plugin.Begin(ctx, oauth.BeginRequest{Provider: "google", RedirectURL: "/dashboard"})
 	require.NoError(t, err)
 	assert.Equal(t, "google", result.Provider)
+	assert.Equal(t, oauth.IntentSignIn, result.Intent)
 	assert.NotEmpty(t, result.Binding)
 
 	// The URL is the provider's, with what Begin created for the sign-in.
@@ -203,6 +236,8 @@ func TestOAuthBeginStartsASignIn(t *testing.T) {
 
 	meta := token.MetadataJSON
 	assert.Equal(t, "google", meta["provider"])
+	assert.Equal(t, "sign_in", meta["intent"])
+	assert.NotContains(t, meta, "session_id", "a sign-in is not bound to a session")
 	assert.Equal(t, "/dashboard", meta["redirect_url"])
 	assert.Equal(t, sent.Nonce, meta["nonce"])
 	assert.Equal(t, utils.LookupHashOf(result.Binding), meta["binding_hash"], "only the hash of the binding value is kept")
@@ -278,7 +313,7 @@ func TestOAuthBeginHooks(t *testing.T) {
 			case "wrong":
 				return nil, errs.NewUnauthorized("test", "captcha_failed", "captcha failed")
 			case "rewrite":
-				payload["provider"] = "google"
+				payload["provider"], payload["intent"] = "google", "link"
 			}
 			return payload, nil
 		}, nil); err != nil {
@@ -302,20 +337,23 @@ func TestOAuthBeginHooks(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, payloads, 1)
-	assert.Equal(t, behemoth.M{"provider": "google", "redirect_url": "/dashboard", "captcha": "ok"}, payloads[0])
+	assert.Equal(t, behemoth.M{"provider": "google", "redirect_url": "/dashboard", "intent": "sign_in", "captcha": "ok"}, payloads[0])
 	require.Len(t, started, 1)
 	assert.Equal(t, result.TransactionID, started[0].TransactionID)
 	assert.Equal(t, "google", started[0].Provider)
+	assert.Equal(t, oauth.IntentSignIn, started[0].Intent)
 	assert.Empty(t, started[0].AuthorizationURL, "a handler does not get the URL")
 	assert.Empty(t, started[0].State, "a handler does not get the state")
 	assert.Empty(t, started[0].Binding, "a handler does not get the binding value")
 	assert.NotEmpty(t, result.AuthorizationURL, "the caller's result is not the handler's copy")
 	assert.NotEmpty(t, result.Binding)
 
-	// A handler's rewrite is what the flow runs with.
+	// A handler's rewrite is what the flow runs with, except for the
+	// intent, which is the flow's.
 	rewritten, err := app.plugin.Begin(ctx, oauth.BeginRequest{Provider: "elsewhere", Extra: behemoth.M{"captcha": "rewrite"}})
 	require.NoError(t, err)
 	assert.Equal(t, "google", rewritten.Provider)
+	assert.Equal(t, oauth.IntentSignIn, rewritten.Intent)
 
 	// A refusal fires the failed point and starts nothing.
 	before := app.tokens(t, "1 = 1")
@@ -371,6 +409,8 @@ func TestOAuthInitChecksTheOptions(t *testing.T) {
 		"a callback URL with a fragment":  {CustomProviders: []oauth.Provider{google()}, CallbackURL: "https://app.example.com/cb#x"},
 		"a callback URL that is not http": {CustomProviders: []oauth.Provider{google()}, CallbackURL: "myapp://callback"},
 		"a negative state TTL":            {CustomProviders: []oauth.Provider{google()}, StateTTL: -time.Minute},
+		"a link by email for no provider": {CustomProviders: []oauth.Provider{google()}, LinkByVerifiedEmail: []string{"github"}},
+		"stored tokens of no provider":    {CustomProviders: []oauth.Provider{google()}, StoreTokens: []string{"github"}},
 	}
 	for name, opts := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -404,8 +444,9 @@ func TestOAuthBeginBeforeBoot(t *testing.T) {
 // before point, and refuses a field of the wrong type.
 func TestOAuthBeginRequestMaps(t *testing.T) {
 	var req oauth.BeginRequest
-	require.NoError(t, req.FromMap(map[string]any{"provider": "google", "redirect_url": "/home", "captcha": "tok", "locale": "am"}))
-	assert.Equal(t, oauth.BeginRequest{Provider: "google", RedirectURL: "/home", Extra: behemoth.M{"captcha": "tok", "locale": "am"}}, req)
+	require.NoError(t, req.FromMap(map[string]any{"provider": "google", "redirect_url": "/home", "captcha": "tok", "locale": "am", "intent": "link"}))
+	assert.Equal(t, oauth.BeginRequest{Provider: "google", RedirectURL: "/home", Extra: behemoth.M{"captcha": "tok", "locale": "am"}}, req,
+		"the intent is dropped: a body can't choose it")
 
 	// An extra field can't stand in for one of the request's own.
 	req.Extra["provider"] = "elsewhere"

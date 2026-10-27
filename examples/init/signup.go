@@ -24,7 +24,7 @@ func signup(ctx context.Context, email, password, invite string) error {
 		return err
 	}
 	defer obs.shutdown(ctx) // a short-lived command has to flush before it exits
-	_, ep, sqlDB, err := boot(ctx, nil, obs.tel)
+	_, plugs, sqlDB, err := boot(ctx, nil, obs.tel)
 	if err != nil {
 		return err
 	}
@@ -35,13 +35,13 @@ func signup(ctx context.Context, email, password, invite string) error {
 	if invite != "" {
 		input["inviteCode"] = invite
 	}
-	user, err := ep.SignUp(ctx, input)
+	user, err := plugs.passwords.SignUp(ctx, input)
 	if err != nil {
 		return fmt.Errorf("sign-up: %w", err)
 	}
 	fmt.Printf("created user %s (%s)\n", user.ID, user.Email)
 
-	result, err := ep.SignIn(ctx, emailpassword.EmailAndPasswordCredentials{Email: email, Password: password})
+	result, err := plugs.passwords.SignIn(ctx, emailpassword.EmailAndPasswordCredentials{Email: email, Password: password})
 	if err != nil {
 		return fmt.Errorf("sign-in: %w", err)
 	}

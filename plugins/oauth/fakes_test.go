@@ -43,6 +43,7 @@ type recorded struct {
 	path   string
 	header http.Header
 	form   url.Values
+	body   []byte // a body that is not a form
 }
 
 // testIssuer is an OpenID Connect issuer over TLS: a discovery document, a
@@ -59,6 +60,7 @@ type testIssuer struct {
 	jwksDown bool // the key set answers 503
 	token    func(form url.Values) (int, any)
 	userinfo func(r *http.Request) (int, any)
+	revoke   func(form url.Values) int // the revocation endpoint's status; 200 when nil
 	requests []recorded
 	fetches  map[string]int
 }
@@ -112,6 +114,12 @@ func (iss *testIssuer) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		answer(iss.userinfo(r))
+	case "/revoke":
+		status := http.StatusOK
+		if iss.revoke != nil {
+			status = iss.revoke(r.PostForm)
+		}
+		w.WriteHeader(status)
 	default:
 		http.NotFound(w, r)
 	}

@@ -153,6 +153,7 @@ The payload is not passed to `KeyFunc`. The firing site publishes what a rule ma
 | `auth.passwordReset.beforeRequest`, `.before` | `HookValueEmail`: the email, normalized | `emailpassword.Plugin.RequestPasswordReset`; `ResetPassword`, when the token names one |
 | `auth.emailVerification.beforeSend`, `.beforeVerify` | `HookValueEmail`: the email, normalized | `emailverification.Plugin` (`sendVerification`, `Verify`) |
 | `auth.emailChange.beforeRequest`, `.beforeConfirm`, `.beforeRevert` | `HookValueUserID`: the user whose address changes | `emailverification.Plugin` (`RequestChange`, `readChangeToken`) |
+| `auth.oauth.beforeBegin` for a link, `auth.oauth.beforeLink`, `.beforeUnlink` | `HookValueUserID`: the user whose provider account changes; `oauth.HookValueProvider` on the link and unlink points | `oauth.Plugin.BeginLink`, `Complete` for a link (`finishLink`) and for a sign-in that links by a verified email (`linkByVerifiedEmail`), `Unlink` |
 | `auth.session.beforeCreate` | `HookValueUserID`: the user's id as a string | `DefaultSessionManager.create` |
 | `token.beforeIssue` | `HookValueTokenKind`, `HookValueTokenSubject` | `DefaultTokenManager.issue` |
 | `auth.signOut.before` | `HookValueSessionID` | `SignOut` (it predates this, for the audit event) |

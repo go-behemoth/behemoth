@@ -30,10 +30,21 @@ type routeAnswer struct {
 // the cookies a browser would attach, from one client address.
 func (app *oauthApp) post(t *testing.T, path, body string, cookies ...*http.Cookie) routeAnswer {
 	t.Helper()
+	return app.send(t, http.MethodPost, path, body, "", cookies...)
+}
+
+// send is post with method, and with bearer, when it is not empty, as the
+// session token of the header delivery.
+func (app *oauthApp) send(t *testing.T, method, path, body, bearer string, cookies ...*http.Cookie) routeAnswer {
+	t.Helper()
 	route, ok := app.mounted["/api/auth"+path]
 	require.True(t, ok, "no route is mounted at %s", path)
-	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+	require.Equal(t, method, route.Method, "the method of %s", path)
+	req := httptest.NewRequest(method, route.Path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
@@ -281,4 +292,109 @@ func TestOAuthRoutesReadTheCarrierDefaults(t *testing.T) {
 	assert.Equal(t, httpapi.DefaultSessionCookieName, begun.carrier.Config().CookieName)
 	assert.NotContains(t, begun.body, "binding")
 	assert.NotNil(t, begun.cookie(t, "__Host-"+oauth.BindingCookiePrefix))
+}
+
+// A signed-in user links, lists, and unlinks a provider account through the
+// routes. A completed link answers with its status and the account, and
+// delivers no session token.
+func TestOAuthLinkRoutes(t *testing.T) {
+	app, err := bootOAuth(t, oauth.Options{}, nil)
+	require.NoError(t, err)
+	app.google.identity = oauth.Identity{Subject: "g-7"}
+	user := app.member(t, "ada@example.com", true)
+	_, token := app.sessionOf(t, user.ID)
+
+	begun := app.send(t, http.MethodPost, oauth.PathLink, `{"provider":"google","redirect_url":"/settings"}`, token)
+	require.Equal(t, http.StatusOK, begun.StatusCode, begun.body)
+	assert.Equal(t, "no-store", begun.Header.Get("Cache-Control"))
+	binding, _ := begun.body["binding"].(string)
+	require.NotEmpty(t, binding, "the header delivery gets the binding value in the body")
+
+	done := app.send(t, http.MethodPost, oauth.PathComplete, completeBody(stateOf(t, begun), `,"binding":"`+binding+`"`), token)
+	require.Equal(t, http.StatusOK, done.StatusCode, done.body)
+	assert.Equal(t, "linked", done.body["status"])
+	assert.Equal(t, "/settings", done.body["redirect_url"])
+	account, _ := done.body["account"].(map[string]any)
+	assert.Equal(t, "google", account["provider"])
+	assert.NotEmpty(t, account["created_at"])
+	assert.Len(t, account, 2, "the subject stays out")
+	assert.NotContains(t, done.body, "user", "a link is not a sign-in")
+	assert.Empty(t, done.Header.Get(httpapi.SessionTokenHeader), "a link delivers no session token")
+	assert.Equal(t, "no-store", done.Header.Get("Cache-Control"))
+
+	listed := app.send(t, http.MethodGet, oauth.PathAccounts, "", token)
+	require.Equal(t, http.StatusOK, listed.StatusCode, listed.body)
+	assert.Equal(t, "no-store", listed.Header.Get("Cache-Control"))
+	accounts, _ := listed.body["accounts"].([]any)
+	require.Len(t, accounts, 1)
+	assert.Equal(t, account, accounts[0], "the same shape as the link's answer")
+
+	unlinked := app.send(t, http.MethodPost, oauth.PathUnlink, `{"provider":"google"}`, token)
+	require.Equal(t, http.StatusOK, unlinked.StatusCode, unlinked.body)
+	assert.Equal(t, behemoth.M{"status": "unlinked"}, unlinked.body)
+	listed = app.send(t, http.MethodGet, oauth.PathAccounts, "", token)
+	assert.Equal(t, []any{}, listed.body["accounts"], "an empty list, not null")
+}
+
+// Under the cookie delivery the session cookie authenticates the link, the
+// binding value travels in a cookie, and completing the link sets no
+// session cookie.
+func TestOAuthLinkRoutesUnderTheCookieDelivery(t *testing.T) {
+	app, err := bootOAuth(t, oauth.Options{}, nil, withDelivery(httpapi.DeliveryCookie))
+	require.NoError(t, err)
+	app.google.identity = oauth.Identity{Subject: "g-7"}
+	user := app.member(t, "ada@example.com", true)
+	_, token := app.sessionOf(t, user.ID)
+	session := &http.Cookie{Name: httpapi.DefaultSessionCookieName, Value: token}
+
+	begun := app.post(t, oauth.PathLink, `{"provider":"google"}`, session)
+	require.Equal(t, http.StatusOK, begun.StatusCode, begun.body)
+	assert.NotContains(t, begun.body, "binding")
+	binding := begun.cookie(t, "__Host-"+oauth.BindingCookiePrefix)
+
+	missing := app.post(t, oauth.PathComplete, completeBody(stateOf(t, begun)), binding)
+	assert.Equal(t, http.StatusUnauthorized, missing.StatusCode, "without the session cookie")
+	assert.Equal(t, "session_missing", missing.body["code"])
+
+	done := app.post(t, oauth.PathComplete, completeBody(stateOf(t, begun)), session, binding)
+	require.Equal(t, http.StatusOK, done.StatusCode, done.body)
+	assert.Equal(t, "linked", done.body["status"])
+	for _, c := range done.Cookies() {
+		assert.NotEqual(t, httpapi.DefaultSessionCookieName, c.Name, "no session cookie is set")
+	}
+	cleared := done.cookie(t, binding.Name)
+	assert.Equal(t, -1, cleared.MaxAge, "the used binding cookie is removed")
+}
+
+// The routes on provider accounts answer each refusal with its status and
+// code.
+func TestOAuthLinkRoutesRefuse(t *testing.T) {
+	app, err := bootOAuth(t, oauth.Options{CustomProviders: []oauth.Provider{&fakeProvider{id: "google"}, &fakeProvider{id: "github"}}}, nil)
+	require.NoError(t, err)
+	user := app.member(t, "ada@example.com", false)
+	app.linkedTo(t, user, "google", "g-ada")
+	_, token := app.sessionOf(t, user.ID)
+
+	cases := []struct {
+		method, path, body, bearer string
+		status                     int
+		code                       string
+	}{
+		{http.MethodPost, oauth.PathLink, `{"provider":"github"}`, "", http.StatusUnauthorized, "session_missing"},
+		{http.MethodGet, oauth.PathAccounts, "", "", http.StatusUnauthorized, "session_missing"},
+		{http.MethodPost, oauth.PathUnlink, `{"provider":"google"}`, "", http.StatusUnauthorized, "session_missing"},
+		{http.MethodPost, oauth.PathLink, `{"provider":"google"}`, token, http.StatusConflict, oauth.ErrorCodeProviderAlreadyLinked},
+		{http.MethodPost, oauth.PathLink, `{"provider":"facebook"}`, token, http.StatusBadRequest, "provider_invalid_input"},
+		{http.MethodPost, oauth.PathLink, `not json`, token, http.StatusBadRequest, "request_validation_error"},
+		{http.MethodPost, oauth.PathUnlink, `{"provider":"google"}`, token, http.StatusConflict, oauth.ErrorCodeLastSignInMethod},
+		{http.MethodPost, oauth.PathUnlink, `{"provider":"github"}`, token, http.StatusConflict, oauth.ErrorCodeProviderNotLinked},
+		{http.MethodPost, oauth.PathUnlink, `{"provider":7}`, token, http.StatusBadRequest, "provider_invalid_input"},
+		{http.MethodPost, oauth.PathUnlink, `{}`, token, http.StatusBadRequest, "provider_invalid_input"},
+		{http.MethodPost, oauth.PathUnlink, `not json`, token, http.StatusBadRequest, "request_validation_error"},
+	}
+	for _, tc := range cases {
+		answer := app.send(t, tc.method, tc.path, tc.body, tc.bearer)
+		assert.Equal(t, tc.status, answer.StatusCode, "%s %s", tc.path, tc.body)
+		assert.Equal(t, tc.code, answer.body["code"], "%s %s", tc.path, tc.body)
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/go-behemoth/behemoth/migration"
 	"github.com/go-behemoth/behemoth/plugins/emailpassword"
 	"github.com/go-behemoth/behemoth/plugins/magiclink"
+	"github.com/go-behemoth/behemoth/plugins/oauth"
 	"github.com/go-behemoth/behemoth/plugins/twofactor"
 	_ "github.com/lib/pq"
 )
@@ -17,14 +18,28 @@ import (
 // always see the same plugins, the same schema and therefore the same
 // SchemaResolver.
 
-// plugins returns the plugin list for Prepare. The email/password plugin is
-// returned a second time by its own type, because the signup command calls
-// its SignUp and SignIn methods directly.
+// appPlugins are the plugins for Prepare, and those a command calls
+// directly.
+type appPlugins struct {
+	all []core.Plugin
+	// passwords is the email/password plugin, whose SignUp and SignIn the
+	// signup command calls.
+	passwords *emailpassword.Plugin
+	// oauth is the OAuth plugin, whose AccessToken the oauth-token command
+	// calls, and oauthProviders the ids of its providers, which the OAuth
+	// page offers. oauth is nil when the environment configures no provider
+	// (oauth.go).
+	oauth          *oauth.Plugin
+	oauthProviders []string
+}
+
+// plugins returns the plugins for Prepare.
 //
 // Two of them mail a link, and each is told which page of the application
 // its link opens (pages.go). The messages go to the sender in BootConfig.Mail
-// (mail.go).
-func plugins() ([]core.Plugin, *emailpassword.Plugin) {
+// (mail.go). The OAuth plugin has no table of its own, so `migrate` writes
+// the same migration with or without it.
+func plugins() appPlugins {
 	ep := emailpassword.New(emailpassword.Options{
 		// Setting the link URL is what turns password reset on.
 		Reset: emailpassword.ResetOptions{LinkURL: appURL() + pathResetPage},
@@ -39,7 +54,13 @@ func plugins() ([]core.Plugin, *emailpassword.Plugin) {
 		Issuer:  "Behemoth example",
 		Methods: []twofactor.Method{twofactor.MethodTOTP, twofactor.MethodEmail},
 	})
-	return []core.Plugin{ep, ml, tf, &ActivityPlugin{}}, ep
+	all := []core.Plugin{ep, ml, tf, &ActivityPlugin{}}
+	// Sign-in with a provider, when one is configured.
+	oa, providers := oauthPlugin()
+	if oa != nil {
+		all = append(all, oa)
+	}
+	return appPlugins{all: all, passwords: ep, oauth: oa, oauthProviders: providers}
 }
 
 func prepareConfig() engine.PrepareConfig {

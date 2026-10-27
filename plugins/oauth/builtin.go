@@ -70,8 +70,9 @@ type ProviderConfig struct {
 
 // newBuiltinProvider returns the provider cfg describes, or a configuration
 // error naming the field that is wrong. at is cfg's place in
-// Options.Providers, for the error.
-func newBuiltinProvider(at string, cfg ProviderConfig, client providerHTTP, now func() time.Time) (Provider, error) {
+// Options.Providers, for the error. storeTokens holds the ids of
+// Options.StoreTokens.
+func newBuiltinProvider(at string, cfg ProviderConfig, client providerHTTP, now func() time.Time, storeTokens map[string]bool) (Provider, error) {
 	scopes := cfg.Scopes
 	if len(scopes) == 0 {
 		scopes = defaultScopes[cfg.Kind]
@@ -110,15 +111,21 @@ func newBuiltinProvider(at string, cfg ProviderConfig, client providerHTTP, now 
 		if cfg.Issuer != "" {
 			return nil, fmt.Errorf("%s.Issuer is set; GitHub has its endpoints built in", at)
 		}
-		return &githubProvider{id: id, auth: auth, scopes: scopes, http: client}, nil
+		return &githubProvider{id: id, auth: auth, scopes: scopes, http: client, now: now}, nil
 	case KindGoogle:
 		if cfg.Issuer != "" {
 			return nil, fmt.Errorf("%s.Issuer is set; Google's is built in", at)
 		}
-		return &oidcProvider{
+		google := &oidcProvider{
 			id: id, issuer: googleIssuer, issuers: []string{googleIssuer, "accounts.google.com"},
 			auth: auth, scopes: scopes, http: client, now: now,
-		}, nil
+		}
+		if storeTokens[id] {
+			// Google issues a refresh token only to a client that asks for
+			// offline access, and ignores the scope offline_access.
+			google.authParams = url.Values{"access_type": {"offline"}}
+		}
+		return google, nil
 	}
 
 	if err := outbound.CheckURL(cfg.Issuer); err != nil {

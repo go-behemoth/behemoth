@@ -11,6 +11,7 @@ import (
 	"github.com/go-behemoth/behemoth/engine"
 	"github.com/go-behemoth/behemoth/errs"
 	"github.com/go-behemoth/behemoth/httpapi"
+	"github.com/go-behemoth/behemoth/models"
 	"github.com/go-behemoth/behemoth/outbound"
 	"github.com/go-behemoth/behemoth/plugins/oauth"
 	"github.com/go-behemoth/behemoth/telemetry"
@@ -37,16 +38,18 @@ type fakeIssuer struct {
 	key    *rsa.PrivateKey
 	issuer string // the issuer the documents name: the server's URL, or Google's
 
-	mu      sync.Mutex
-	subject string
-	email   string
-	nonce   string
-	idIss   string // the iss of the next ID token; the issuer when empty
-	github  []map[string]any
-	token   []url.Values
-	auth    []string
-	hosts   []string
-	agents  []string
+	mu        sync.Mutex
+	subject   string
+	email     string
+	nonce     string
+	idIss     string // the iss of the next ID token; the issuer when empty
+	expiresIn int    // the lifetime of an access token a code redeems, in seconds; none when zero
+	github    []map[string]any
+	token     []url.Values
+	auth      []string
+	hosts     []string
+	agents    []string
+	grants    []string // the access tokens of GitHub grants deleted
 }
 
 func newFakeIssuer(t *testing.T, issuer string) *fakeIssuer {
@@ -86,6 +89,10 @@ func (f *fakeIssuer) serve(t *testing.T, w http.ResponseWriter, r *http.Request)
 	case "/token":
 		f.token = append(f.token, r.PostForm)
 		f.auth = append(f.auth, r.Header.Get("Authorization"))
+		if r.PostForm.Get("grant_type") == "refresh_token" {
+			answer(map[string]any{"access_token": "access-2", "token_type": "Bearer", "expires_in": 3600})
+			return
+		}
 		iss := f.idIss
 		if iss == "" {
 			iss = f.issuer
@@ -98,10 +105,25 @@ func (f *fakeIssuer) serve(t *testing.T, w http.ResponseWriter, r *http.Request)
 		idToken.Header["kid"] = "k1"
 		signed, err := idToken.SignedString(f.key)
 		require.NoError(t, err)
-		answer(map[string]any{"access_token": "access-1", "token_type": "Bearer", "id_token": signed})
+		tokens := map[string]any{"access_token": "access-1", "token_type": "Bearer", "id_token": signed, "refresh_token": "refresh-1"}
+		if f.expiresIn > 0 {
+			tokens["expires_in"] = f.expiresIn
+		}
+		answer(tokens)
 	case "/login/oauth/access_token":
 		f.token = append(f.token, r.PostForm)
 		answer(map[string]any{"access_token": "gho_1", "token_type": "bearer"})
+	case "/applications/gh-client/grant":
+		var body struct {
+			AccessToken string `json:"access_token"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		if id, secret, ok := r.BasicAuth(); ok && id == "gh-client" && secret == "gh-secret" {
+			f.grants = append(f.grants, body.AccessToken)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
 	case "/user":
 		answer(map[string]any{"id": 583231, "name": "The Octocat", "avatar_url": "https://avatars.example.com/u/583231"})
 	case "/user/emails":
@@ -379,4 +401,71 @@ func TestOAuthChecksTheProviderConfigs(t *testing.T) {
 		assert.False(t, errs.IsRejection(err))
 		assert.NotContains(t, strings.ToLower(err.Error()), "s3cret")
 	})
+}
+
+// With its tokens stored, an OpenID Connect provider's tokens land in the
+// account at the sign-in, and AccessToken refreshes an access token that
+// expires within a minute at the issuer's token endpoint.
+func TestOAuthRefreshesAtTheIssuer(t *testing.T) {
+	fake := newFakeIssuer(t, "")
+	fake.expiresIn = 30
+	app, err := bootOAuth(t, oauth.Options{
+		Providers:   []oauth.ProviderConfig{{Kind: oauth.KindOIDC, ID: "acme", Issuer: fake.srv.URL, ClientID: "client-1", ClientSecret: secretOf("s3cret")}},
+		HTTPClient:  fake.client(),
+		StoreTokens: []string{"acme"},
+	}, nil)
+	require.NoError(t, err)
+
+	begun, err := app.plugin.Begin(context.Background(), oauth.BeginRequest{Provider: "acme"})
+	require.NoError(t, err)
+	fake.expect(t, begun.AuthorizationURL)
+	signedIn, err := app.plugin.Complete(context.Background(), oauth.CompleteRequest{
+		Provider: "acme", Code: "code-1", State: begun.State, Binding: begun.Binding,
+	})
+	require.NoError(t, err)
+	account, err := app.ac.Store.FindAccount(context.Background(), "acme", "user-42")
+	require.NoError(t, err)
+	assert.Equal(t, "access-1", account.AccessToken)
+	assert.Equal(t, "refresh-1", account.RefreshToken)
+	assert.NotEmpty(t, account.IDToken, "the ID token the provider checked")
+	assert.Equal(t, "openid email profile", account.Scope)
+
+	caller, _ := app.sessionOf(t, signedIn.User.ID)
+	token, err := app.plugin.AccessToken(caller, oauth.AccessTokenRequest{Provider: "acme"})
+	require.NoError(t, err)
+	assert.Equal(t, "access-2", token.AccessToken)
+	assert.WithinDuration(t, time.Now().Add(time.Hour), token.ExpiresAt, 5*time.Second)
+	refresh := fake.token[len(fake.token)-1]
+	assert.Equal(t, "refresh_token", refresh.Get("grant_type"))
+	assert.Equal(t, "refresh-1", refresh.Get("refresh_token"))
+	assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("client-1:s3cret")), fake.auth[len(fake.auth)-1])
+}
+
+// Unlinking a GitHub account whose tokens are stored deletes the
+// application's grant at GitHub.
+func TestOAuthRevokesAtGitHub(t *testing.T) {
+	fake := newFakeIssuer(t, "")
+	fake.github = []map[string]any{{"email": "octocat@example.com", "primary": true, "verified": true}}
+	app, err := bootOAuth(t, oauth.Options{
+		Providers:   []oauth.ProviderConfig{{Kind: oauth.KindGitHub, ClientID: "gh-client", ClientSecret: secretOf("gh-secret")}},
+		HTTPClient:  fake.client(),
+		StoreTokens: []string{"github"},
+	}, nil)
+	require.NoError(t, err)
+	begun, err := app.plugin.Begin(context.Background(), oauth.BeginRequest{Provider: "github"})
+	require.NoError(t, err)
+	signedIn, err := app.plugin.Complete(context.Background(), oauth.CompleteRequest{
+		Provider: "github", Code: "code-1", State: begun.State, Binding: begun.Binding,
+	})
+	require.NoError(t, err)
+	// A password, so that the GitHub account is not the last way in.
+	require.NoError(t, app.ac.Store.CreateAccount(context.Background(), &models.Account{
+		UserID: signedIn.User.ID, ProviderID: models.ProviderCredential, AccountID: signedIn.User.ID, PasswordHash: "$argon2id$not-a-real-hash",
+	}))
+
+	caller, _ := app.sessionOf(t, signedIn.User.ID)
+	_, err = app.plugin.Unlink(caller, oauth.UnlinkRequest{Provider: "github"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"gho_1"}, fake.grants)
+	assert.Contains(t, fake.hosts, "api.github.com")
 }
