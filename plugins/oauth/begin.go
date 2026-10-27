@@ -11,7 +11,9 @@ import (
 
 	"github.com/go-behemoth/behemoth"
 	"github.com/go-behemoth/behemoth/core"
+	"github.com/go-behemoth/behemoth/core/hooks"
 	"github.com/go-behemoth/behemoth/errs"
+	"github.com/go-behemoth/behemoth/identity"
 	"github.com/go-behemoth/behemoth/store"
 	"github.com/go-behemoth/behemoth/telemetry"
 	"github.com/go-behemoth/behemoth/utils"
@@ -21,6 +23,19 @@ import (
 const (
 	keyProvider    = "provider"
 	keyRedirectURL = "redirect_url"
+	keyIntent      = "intent"
+)
+
+// Intent says what a started sign-in is for: BeginResult.Intent, and the
+// "intent" key of the auth.oauth.beforeBegin payload.
+type Intent string
+
+const (
+	// IntentSignIn is a sign-in, started with Begin.
+	IntentSignIn Intent = "sign_in"
+	// IntentLink is a link of a provider account to the signed-in user,
+	// started with BeginLink.
+	IntentLink Intent = "link"
 )
 
 // Keys of the metadata a started sign-in is kept with, on its oauth_state
@@ -33,7 +48,18 @@ const (
 	metaNonce       = "nonce"
 	metaVerifier    = "verifier_secret"
 	metaBindingHash = "binding_hash"
+	metaIntent      = "intent"
+	// metaSessionID is the session a link was started in. A sign-in has
+	// none.
+	metaSessionID = "session_id"
 )
+
+// linkOwner is who started a link: the user the provider account is for,
+// and the session the link has to be completed in.
+type linkOwner struct {
+	userID    string
+	sessionID string
+}
 
 // verifierBinding binds the sealed verifier of a sign-in to the hash of its
 // binding value, kept beside it. The token's id would be the obvious owner,
@@ -42,10 +68,11 @@ func verifierBinding(bindingHash string) store.SealBinding {
 	return store.SealBinding{Purpose: "oauth.pkce_verifier", Owner: bindingHash}
 }
 
-// BeginRequest is the input of Begin.
+// BeginRequest is the input of Begin and BeginLink.
 //
 // It implements [behemoth.Serializable]. The auth.oauth.beforeBegin payload
-// is flat: "provider", "redirect_url" and the keys of Extra.
+// is flat: "provider", "redirect_url", "intent", which the flow sets, and
+// the keys of Extra.
 type BeginRequest struct {
 	// Provider is the id of the provider to sign in with (Provider.ID).
 	Provider string
@@ -69,9 +96,11 @@ func (r *BeginRequest) ToMap() (map[string]any, error) {
 }
 
 // FromMap sets the request from a request body or a rewritten payload:
-// "provider" and "redirect_url" fill the fields, and every other key goes to
-// Extra, which is replaced. A missing key leaves its field empty. A provider
-// or a redirect URL that is not a string is a validation error.
+// "provider" and "redirect_url" fill the fields, "intent" is dropped, and
+// every other key goes to Extra, which is replaced. A missing key leaves its
+// field empty. A provider or a redirect URL that is not a string is a
+// validation error. The intent is the flow's: a body or a handler can't
+// turn a sign-in into a link, or a link into a sign-in.
 func (r *BeginRequest) FromMap(data map[string]any) error {
 	const op = "oauth.Begin"
 	field := func(key string) (string, error) {
@@ -94,7 +123,7 @@ func (r *BeginRequest) FromMap(data map[string]any) error {
 	}
 	var extra behemoth.M
 	for k, v := range data {
-		if k == keyProvider || k == keyRedirectURL {
+		if k == keyProvider || k == keyRedirectURL || k == keyIntent {
 			continue
 		}
 		if extra == nil {
@@ -106,11 +135,14 @@ func (r *BeginRequest) FromMap(data map[string]any) error {
 	return nil
 }
 
-// BeginResult is what Begin returns. Handlers on auth.oauth.afterBegin
-// receive it without AuthorizationURL, State and Binding.
+// BeginResult is what Begin and BeginLink return. Handlers on
+// auth.oauth.afterBegin receive it without AuthorizationURL, State and
+// Binding.
 type BeginResult struct {
 	// Provider is the id of the provider the sign-in is with.
 	Provider string
+	// Intent is IntentSignIn for Begin and IntentLink for BeginLink.
+	Intent Intent
 	// TransactionID is the id of the token the sign-in is kept as.
 	TransactionID string
 	// AuthorizationURL is the URL at the provider to send the browser to.
@@ -131,7 +163,8 @@ type BeginResult struct {
 // state, the PKCE verifier, the nonce and the binding value of the sign-in,
 // keeps them as a single-use token, and returns the provider's authorization
 // URL with the binding value. Complete finishes the sign-in. Begin fires
-// auth.oauth.beforeBegin, .afterBegin and .beginFailed.
+// auth.oauth.beforeBegin, .afterBegin and .beginFailed, with the intent
+// IntentSignIn.
 //
 // A provider the plugin was not configured with and a redirect URL outside
 // the trusted origins are validation errors. An error of the provider is
@@ -140,18 +173,64 @@ type BeginResult struct {
 // Pass the context of the request being handled when there is one. The
 // plugin must have been initialized by Boot.
 func (p *Plugin) Begin(ctx context.Context, req BeginRequest) (*BeginResult, error) {
-	hctx, err := p.operation(ctx, "oauth.Begin")
+	return p.begin(ctx, "oauth.Begin", req, nil)
+}
+
+// BeginLink starts a link of a provider account to the caller's account:
+// once the user signs in at the provider req.Provider, Complete attaches
+// the provider's account to the caller's user, and the provider signs the
+// user in from then on. It checks and returns what Begin does, and fires
+// the same points, with the intent IntentLink. The started link names the
+// caller's user and session, and only that session can complete it.
+//
+// The caller needs PermissionManage and a fresh session
+// (Access.RequireFreshUser): a link adds a way into the account. A system
+// caller acting for a user has no session to complete the link in, and gets
+// a session error with errs.CodeSessionMissing. A provider the user has an
+// account at already is a conflict with ErrorCodeProviderAlreadyLinked: a
+// user has at most one account per provider.
+//
+// Pass the context of the request being handled. The plugin must have been
+// initialized by Boot.
+func (p *Plugin) BeginLink(ctx context.Context, req BeginRequest) (*BeginResult, error) {
+	const op = "oauth.BeginLink"
+	if err := p.ready(op); err != nil {
+		return nil, err
+	}
+	userID, err := p.authContext.Access.RequireFreshUser(ctx, PermissionManage)
+	if err != nil {
+		return nil, err
+	}
+	session, ok := identity.CallerFrom(ctx).Session()
+	if !ok {
+		// A system caller acting for the user: Complete would have no
+		// session to compare with.
+		return nil, errs.NewSessionError(op, errs.CodeSessionMissing, nil)
+	}
+	return p.begin(ctx, op, req, &linkOwner{userID: userID, sessionID: session.ID})
+}
+
+// begin is Begin, and BeginLink once the caller is checked: owner is nil for
+// a sign-in, and names the user and the session of a link.
+func (p *Plugin) begin(ctx context.Context, op string, req BeginRequest, owner *linkOwner) (*BeginResult, error) {
+	hctx, err := p.operation(ctx, op)
 	if err != nil {
 		return nil, err
 	}
 	// One operation: the three points and the token write share Values.
 	hctx = core.AsOperation(hctx)
 	dispatcher := p.authContext.Dispatcher
+	intent := IntentSignIn
+	if owner != nil {
+		intent = IntentLink
+		hctx.Values[hooks.HookValueUserID] = owner.userID
+	}
 
 	payload, err := req.ToMap()
 	if err != nil {
 		return nil, err
 	}
+	payload[keyIntent] = string(intent)
 	payload, err = dispatcher.RunBefore(hctx, HookBeginBefore, payload)
 	if err != nil {
 		return nil, core.FailIfRejected(dispatcher, hctx, HookBeginFailed, err, core.FailureReason{})
@@ -160,7 +239,7 @@ func (p *Plugin) Begin(ctx context.Context, req BeginRequest) (*BeginResult, err
 		return nil, err
 	}
 
-	result, err := p.beginBody(hctx, req)
+	result, err := p.beginBody(hctx, op, req, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -174,8 +253,7 @@ func (p *Plugin) Begin(ctx context.Context, req BeginRequest) (*BeginResult, err
 	return result, nil
 }
 
-func (p *Plugin) beginBody(hctx *core.HookContext, req BeginRequest) (*BeginResult, error) {
-	const op = "oauth.Begin"
+func (p *Plugin) beginBody(hctx *core.HookContext, op string, req BeginRequest, owner *linkOwner) (*BeginResult, error) {
 	ac := hctx.Auth
 
 	provider, ok := p.providers[req.Provider]
@@ -184,6 +262,19 @@ func (p *Plugin) beginBody(hctx *core.HookContext, req BeginRequest) (*BeginResu
 	}
 	if req.RedirectURL != "" && !core.TrustedRedirect(ac.Origins, req.RedirectURL) {
 		return nil, errs.NewInvalidInputError(op, keyRedirectURL, "redirect URL is not allowed", nil)
+	}
+	intent := IntentSignIn
+	if owner != nil {
+		intent = IntentLink
+		// Refused here as well as by Complete, so the user is not sent to
+		// the provider for a link that can't be made.
+		linked, err := p.accountAt(hctx.Ctx, owner.userID, provider.ID())
+		if err != nil {
+			return nil, err
+		}
+		if linked != nil {
+			return nil, errProviderAlreadyLinked(op)
+		}
 	}
 
 	// 32 random bytes each. As base64url that is 43 characters, which is
@@ -204,6 +295,7 @@ func (p *Plugin) beginBody(hctx *core.HookContext, req BeginRequest) (*BeginResu
 
 	meta := behemoth.M{
 		metaProvider:    provider.ID(),
+		metaIntent:      string(intent),
 		metaNonce:       nonce,
 		metaVerifier:    sealedVerifier,
 		metaBindingHash: bindingHash,
@@ -211,10 +303,15 @@ func (p *Plugin) beginBody(hctx *core.HookContext, req BeginRequest) (*BeginResu
 	if req.RedirectURL != "" {
 		meta[metaRedirectURL] = req.RedirectURL
 	}
-	// The raw token is the state. The token has no subject: nobody is
-	// signed in yet. Not built: a sign-in that links a provider account to
-	// the signed-in user, whose token would name that user.
-	token, state, err := ac.TokenManager.Issue(hctx.Ctx, core.TokenKindOAuthState, nil, meta)
+	// The raw token is the state. A sign-in's token has no subject: nobody
+	// is signed in yet. A link's names the user, so that Store.DeleteUser
+	// removes it with the user, and keeps the session it was started in.
+	var subject any
+	if owner != nil {
+		subject = owner.userID
+		meta[metaSessionID] = owner.sessionID
+	}
+	token, state, err := ac.TokenManager.Issue(hctx.Ctx, core.TokenKindOAuthState, subject, meta)
 	if err != nil {
 		// A handler or a rate limit on token.beforeIssue may have refused.
 		return nil, core.FailIfRejected(ac.Dispatcher, hctx, HookBeginFailed, err, core.FailureReason{})
@@ -239,6 +336,7 @@ func (p *Plugin) beginBody(hctx *core.HookContext, req BeginRequest) (*BeginResu
 
 	return &BeginResult{
 		Provider:         provider.ID(),
+		Intent:           intent,
 		TransactionID:    token.ID,
 		AuthorizationURL: authorizationURL,
 		State:            state,

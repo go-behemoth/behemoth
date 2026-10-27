@@ -39,7 +39,7 @@ var signingAlgs = []string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
 
 // discoveryDocument is what the plugin reads of an issuer's
 // /.well-known/openid-configuration (OpenID Connect Discovery 1.0, section
-// 3, and RFC 9207, section 3).
+// 3, RFC 8414, section 2, and RFC 9207, section 3).
 type discoveryDocument struct {
 	Issuer                string   `json:"issuer"`
 	AuthorizationEndpoint string   `json:"authorization_endpoint"`
@@ -48,11 +48,15 @@ type discoveryDocument struct {
 	UserinfoEndpoint      string   `json:"userinfo_endpoint"`
 	AuthMethods           []string `json:"token_endpoint_auth_methods_supported"`
 	IssParameterSupported bool     `json:"authorization_response_iss_parameter_supported"`
+	// RevocationEndpoint is empty for an issuer that offers no revocation.
+	RevocationEndpoint    string   `json:"revocation_endpoint"`
+	RevocationAuthMethods []string `json:"revocation_endpoint_auth_methods_supported"`
 }
 
 // oidcProvider is the built-in OpenID Connect provider: the generic one, and
 // Google. It reads the issuer's discovery document on first use, and checks
-// every ID token against the issuer's keys.
+// every ID token against the issuer's keys. It refreshes and revokes tokens
+// at the endpoints the document names.
 type oidcProvider struct {
 	id     string
 	issuer string
@@ -61,8 +65,12 @@ type oidcProvider struct {
 	issuers []string
 	auth    clientAuth
 	scopes  []string
-	http    providerHTTP
-	now     func() time.Time
+	// authParams are parameters of the authorization URL besides the
+	// protocol's own, such as Google's access_type. They never replace one
+	// of the protocol's.
+	authParams url.Values
+	http       providerHTTP
+	now        func() time.Time
 
 	mu         sync.Mutex
 	discovery  *discoveryDocument
@@ -80,7 +88,7 @@ func (p *oidcProvider) AuthorizationURL(ctx context.Context, req AuthorizationRe
 	if err != nil {
 		return "", err
 	}
-	return withQuery(doc.AuthorizationEndpoint, url.Values{
+	params := url.Values{
 		"response_type":         {"code"},
 		"client_id":             {p.auth.clientID},
 		"redirect_uri":          {req.RedirectURI},
@@ -89,7 +97,13 @@ func (p *oidcProvider) AuthorizationURL(ctx context.Context, req AuthorizationRe
 		"nonce":                 {req.Nonce},
 		"code_challenge":        {req.CodeChallenge},
 		"code_challenge_method": {"S256"},
-	})
+	}
+	for key, values := range p.authParams {
+		if _, own := params[key]; !own {
+			params[key] = values
+		}
+	}
+	return withQuery(doc.AuthorizationEndpoint, params)
 }
 
 // Exchange implements [Provider]. It redeems the code, checks the ID token,
@@ -136,7 +150,43 @@ func (p *oidcProvider) Exchange(ctx context.Context, req ExchangeRequest) (*Exch
 		}
 		identity = mergeIdentity(identity, identityFromClaims(info))
 	}
-	return &ExchangeResult{Identity: identity}, nil
+	return &ExchangeResult{Identity: identity, Tokens: withRequestedScope(tokens.tokens(p.now()), p.scopes)}, nil
+}
+
+// Refresh implements [Refresher], at the token endpoint of the discovery
+// document. An ID token in the answer is dropped: it is not checked, and the
+// plugin keeps the one of the sign-in.
+func (p *oidcProvider) Refresh(ctx context.Context, req RefreshRequest) (*Tokens, error) {
+	doc, _, err := p.document(ctx)
+	if err != nil {
+		return nil, err
+	}
+	answer, err := p.http.refreshTokens(ctx, doc.TokenEndpoint, p.auth, authMethod(doc.AuthMethods, p.auth.secret != nil), req.RefreshToken)
+	if err != nil {
+		return nil, err
+	}
+	tokens := answer.tokens(p.now())
+	tokens.IDToken = ""
+	return &tokens, nil
+}
+
+// Revoke implements [Revoker], at the revocation endpoint of the discovery
+// document (RFC 7009): the refresh token when there is one, else the access
+// token. An issuer whose document names no revocation endpoint can't revoke,
+// and Revoke returns nil.
+func (p *oidcProvider) Revoke(ctx context.Context, tokens Tokens) error {
+	token, hint := revocable(tokens)
+	if token == "" {
+		return nil
+	}
+	doc, _, err := p.document(ctx)
+	if err != nil {
+		return err
+	}
+	if doc.RevocationEndpoint == "" {
+		return nil
+	}
+	return p.http.revokeToken(ctx, doc.RevocationEndpoint, p.auth, authMethod(doc.RevocationAuthMethods, p.auth.secret != nil), token, hint)
 }
 
 // authMethod returns how to authenticate at the token endpoint: HTTP Basic
@@ -181,9 +231,14 @@ func (p *oidcProvider) document(ctx context.Context) (*discoveryDocument, *crypt
 			return nil, nil, fmt.Errorf("discovery of %s: %s: %w", p.issuer, name, err)
 		}
 	}
-	if doc.UserinfoEndpoint != "" {
-		if err := outbound.CheckURL(doc.UserinfoEndpoint); err != nil {
-			return nil, nil, fmt.Errorf("discovery of %s: userinfo_endpoint: %w", p.issuer, err)
+	for name, endpoint := range map[string]string{
+		"userinfo_endpoint": doc.UserinfoEndpoint, "revocation_endpoint": doc.RevocationEndpoint,
+	} {
+		if endpoint == "" {
+			continue // optional
+		}
+		if err := outbound.CheckURL(endpoint); err != nil {
+			return nil, nil, fmt.Errorf("discovery of %s: %s: %w", p.issuer, name, err)
 		}
 	}
 	if p.keys == nil || p.discovery.JWKSURI != doc.JWKSURI {

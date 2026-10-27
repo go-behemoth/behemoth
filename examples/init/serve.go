@@ -19,7 +19,6 @@ import (
 	"github.com/go-behemoth/behemoth/engine"
 	"github.com/go-behemoth/behemoth/httpapi"
 	ginadapter "github.com/go-behemoth/behemoth/plugins/adapters/gin"
-	"github.com/go-behemoth/behemoth/plugins/emailpassword"
 	"github.com/go-behemoth/behemoth/storage/adapters/postgres"
 	"github.com/go-behemoth/behemoth/telemetry"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -51,13 +50,18 @@ func serve(ctx context.Context) error {
 		ginEngine.Use(otelgin.Middleware("behemoth-example", otelgin.WithTracerProvider(obs.tracerProvider)))
 	}
 	ginEngine.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "my app") })
-	mountPages(ginEngine) // the pages the mailed links open
 
-	ac, _, sqlDB, err := boot(ctx, ginadapter.New(ginEngine), obs.tel)
+	ac, plugs, sqlDB, err := boot(ctx, ginadapter.New(ginEngine), obs.tel)
 	if err != nil {
 		return err
 	}
 	defer sqlDB.Close()
+	// The pages the mailed links open, and those of a sign-in with a
+	// provider when one is configured.
+	mountPages(ginEngine, plugs.oauthProviders)
+	if len(plugs.oauthProviders) > 0 {
+		log.Printf("sign in with %v at %s%s", plugs.oauthProviders, appURL(), pathOAuthPage)
+	}
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {
@@ -86,23 +90,24 @@ func serve(ctx context.Context) error {
 
 // boot runs Prepare and Boot. driver mounts behemoth's routes on the
 // application's HTTP framework; nil boots without serving, which is what the
-// signup command does. The returned *sql.DB is the caller's to close.
+// other commands do. It returns the plugins, for a command that calls one
+// directly. The returned *sql.DB is the caller's to close.
 //
 // tel is the application's telemetry (telemetry.go). The same logger goes to
 // the database adapter, so SQL statements are logged at debug with the
 // request ID of the request that ran them.
-func boot(ctx context.Context, driver httpapi.FrameworkDriver, tel *telemetry.Telemetry) (*core.AuthContext, *emailpassword.Plugin, *sql.DB, error) {
+func boot(ctx context.Context, driver httpapi.FrameworkDriver, tel *telemetry.Telemetry) (*core.AuthContext, appPlugins, *sql.DB, error) {
 	// 1. Declarations: plugins, hooks, tokens, rate limits, schema -> resolver.
-	all, ep := plugins()
-	app, err := engine.Prepare(all, prepareConfig())
+	plugs := plugins()
+	app, err := engine.Prepare(plugs.all, prepareConfig())
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, appPlugins{}, nil, err
 	}
 
 	// 2. Storage, bound to the resolver Prepare derived from the schema.
 	sqlDB, err := openDB()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, appPlugins{}, nil, err
 	}
 	db := postgres.NewPostgresAdapter(sqlDB, app.Resolver).WithLogger(tel.Logger)
 
@@ -110,7 +115,7 @@ func boot(ctx context.Context, driver httpapi.FrameworkDriver, tel *telemetry.Te
 	cryptoCfg, err := cryptoConfig()
 	if err != nil {
 		sqlDB.Close()
-		return nil, nil, nil, err
+		return nil, appPlugins{}, nil, err
 	}
 	ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
 		Crypto:    cryptoCfg,
@@ -138,11 +143,11 @@ func boot(ctx context.Context, driver httpapi.FrameworkDriver, tel *telemetry.Te
 	})
 	if err != nil {
 		sqlDB.Close()
-		return nil, nil, nil, err
+		return nil, appPlugins{}, nil, err
 	}
 	// Boot has logged its own summary line ("behemoth booted") through tel.
 	log.Printf("schema resolver: todos -> %s", app.Resolver.Resolve("todos"))
-	return ac, ep, sqlDB, nil
+	return ac, plugs, sqlDB, nil
 }
 
 // cryptoConfig reads the master secret (hex, >= 32 bytes) from

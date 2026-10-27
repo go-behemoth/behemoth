@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-behemoth/behemoth/outbound"
 	"github.com/stretchr/testify/assert"
@@ -21,6 +23,7 @@ type testGitHub struct {
 	token    func() (int, any)
 	user     any
 	emails   func() (int, any)
+	grant    int // the status of the grant's deletion; 204 when zero
 	requests []recorded
 }
 
@@ -29,7 +32,9 @@ func (g *testGitHub) serve(t *testing.T) http.HandlerFunc {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		require.NoError(t, r.ParseForm())
-		g.requests = append(g.requests, recorded{method: r.Method, path: r.URL.Path, header: r.Header.Clone(), form: r.PostForm})
+		body, err := io.ReadAll(r.Body) // what ParseForm left: a body that is not a form
+		require.NoError(t, err)
+		g.requests = append(g.requests, recorded{method: r.Method, path: r.URL.Path, header: r.Header.Clone(), form: r.PostForm, body: body})
 		answer := func(status int, body any) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
@@ -42,6 +47,12 @@ func (g *testGitHub) serve(t *testing.T) http.HandlerFunc {
 			answer(http.StatusOK, g.user)
 		case "/user/emails":
 			answer(g.emails())
+		case "/applications/gh-client/grant":
+			status := g.grant
+			if status == 0 {
+				status = http.StatusNoContent
+			}
+			w.WriteHeader(status)
 		default:
 			http.NotFound(w, r)
 		}
@@ -79,7 +90,7 @@ func newTestGitHub(t *testing.T) (*testGitHub, *githubProvider, *rewrite) {
 	client, rw := clientFor(srv)
 	return g, &githubProvider{
 		id: "github", auth: clientAuth{clientID: "gh-client", secret: staticSecret("gh-secret")},
-		scopes: defaultScopes[KindGitHub], http: providerHTTP{client: client},
+		scopes: defaultScopes[KindGitHub], http: providerHTTP{client: client}, now: time.Now,
 	}, rw
 }
 
@@ -164,4 +175,73 @@ func TestGitHubRefusedCode(t *testing.T) {
 	_, err = exchange(p, "")
 	require.Error(t, err, "a user without an id")
 	assert.NotErrorIs(t, err, ErrExchangeRefused)
+}
+
+// The tokens of an exchange: an OAuth App's never expire, and a GitHub App's
+// expire, with a refresh token that expires too. GitHub's commas between
+// scopes become spaces.
+func TestGitHubExchangeTokens(t *testing.T) {
+	g, p, _ := newTestGitHub(t)
+	result, err := exchange(p, "")
+	require.NoError(t, err)
+	assert.Equal(t, Tokens{AccessToken: "gho_1", Scope: "read:user user:email"}, result.Tokens, "an OAuth App's token")
+
+	g.token = func() (int, any) {
+		return http.StatusOK, map[string]any{
+			"access_token": "ghu_1", "token_type": "bearer", "scope": "",
+			"expires_in": 28800, "refresh_token": "ghr_1", "refresh_token_expires_in": "15897600",
+		}
+	}
+	before := time.Now()
+	result, err = exchange(p, "")
+	require.NoError(t, err)
+	tokens := result.Tokens
+	assert.Equal(t, "ghu_1", tokens.AccessToken)
+	assert.Equal(t, "ghr_1", tokens.RefreshToken)
+	assert.Equal(t, "read:user user:email", tokens.Scope, "no scope in the answer is the one asked for")
+	assert.WithinDuration(t, before.Add(8*time.Hour), tokens.ExpiresAt, 5*time.Second)
+	assert.WithinDuration(t, before.Add(15897600*time.Second), tokens.RefreshExpiresAt, 5*time.Second, "a lifetime sent as a string")
+}
+
+// A refresh posts the refresh token with the client's credentials, and a
+// refresh token GitHub refuses wraps ErrExchangeRefused.
+func TestGitHubRefresh(t *testing.T) {
+	g, p, _ := newTestGitHub(t)
+	g.token = func() (int, any) {
+		return http.StatusOK, map[string]any{"access_token": "ghu_2", "expires_in": 28800, "refresh_token": "ghr_2", "refresh_token_expires_in": 15897600}
+	}
+	tokens, err := p.Refresh(context.Background(), RefreshRequest{RefreshToken: "ghr_1"})
+	require.NoError(t, err)
+	assert.Equal(t, "ghu_2", tokens.AccessToken)
+	assert.Equal(t, "ghr_2", tokens.RefreshToken, "GitHub rotates the refresh token")
+	assert.False(t, tokens.ExpiresAt.IsZero())
+	assert.Equal(t, url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {"ghr_1"}, "client_id": {"gh-client"}, "client_secret": {"gh-secret"},
+	}, g.last(t, "/login/oauth/access_token").form)
+
+	g.token = func() (int, any) { return http.StatusOK, map[string]any{"error": "bad_refresh_token"} }
+	_, err = p.Refresh(context.Background(), RefreshRequest{RefreshToken: "ghr_1"})
+	assert.ErrorIs(t, err, ErrExchangeRefused)
+}
+
+// Revoking deletes the application's grant, with the client's credentials
+// and the user's access token. A token GitHub does not take is an error.
+func TestGitHubRevoke(t *testing.T) {
+	g, p, rw := newTestGitHub(t)
+	require.NoError(t, p.Revoke(context.Background(), Tokens{AccessToken: "gho_1", RefreshToken: "ghr_1"}))
+	grant := g.last(t, "/applications/gh-client/grant")
+	assert.Equal(t, http.MethodDelete, grant.method)
+	assert.JSONEq(t, `{"access_token":"gho_1"}`, string(grant.body))
+	clientID, secret, ok := (&http.Request{Header: grant.header}).BasicAuth()
+	require.True(t, ok)
+	assert.Equal(t, "gh-client", clientID)
+	assert.Equal(t, "gh-secret", secret)
+	assert.Equal(t, githubAPIVersion, grant.header.Get("X-Github-Api-Version"))
+	assert.Equal(t, []string{"api.github.com"}, rw.hosts)
+
+	g.grant = http.StatusUnprocessableEntity
+	assert.Error(t, p.Revoke(context.Background(), Tokens{AccessToken: "gho_expired"}))
+
+	require.NoError(t, p.Revoke(context.Background(), Tokens{}), "nothing to revoke")
+	assert.Len(t, rw.hosts, 2, "and no call for it")
 }

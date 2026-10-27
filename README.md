@@ -6,7 +6,7 @@ The project is under active development, and the API may still change.
 
 ## Features
 
-- **Plugins.** Each plugin declares its routes, tables, hooks and rate limits. The first one, `emailpassword`, handles sign-up, sign-in, sign-out and password reset. `magiclink` signs a user in with a link sent by email, `emailverification` confirms a user's address, `username` adds sign-in by username to `emailpassword`, and `phonenumber` adds a confirmed phone number, sign-in by one-time code or password, and password reset by code. `twofactor` asks for a second factor at every sign-in of a user who turns one on: a code from an authenticator app, or a code sent by email or text message, with recovery codes.
+- **Plugins.** Each plugin declares its routes, tables, hooks and rate limits. The first one, `emailpassword`, handles sign-up, sign-in, sign-out and password reset. `magiclink` signs a user in with a link sent by email, `emailverification` confirms a user's address, `username` adds sign-in by username to `emailpassword`, and `phonenumber` adds a confirmed phone number, sign-in by one-time code or password, and password reset by code. `twofactor` asks for a second factor at every sign-in of a user who turns one on: a code from an authenticator app, or a code sent by email or text message, with recovery codes. `oauth` signs a user in through an OAuth 2.0 or OpenID Connect provider, such as Google or GitHub, links provider accounts to an existing user, and can keep the provider's tokens for calls to its API.
 - **Migrations.** Behemoth builds a migration from the tables your plugins and your own schema declare, and writes it to a folder for you to review. `behemoth generate` does it from your application's directory.
 - **Hooks.** Run your code before or after a user is written, or around a whole flow such as sign-up. A handler can change data, stop an operation or react afterwards.
 - **Sessions and tokens.** Sessions are stored in your database or a key-value store, and delivered as a cookie or a header.
@@ -86,7 +86,7 @@ Without a router, call the same flows from code with `plugin.SignUp` and `plugin
 
 ## Examples
 
-[examples/init](./examples/init) is a complete application on PostgreSQL and Gin. It shows migrations, a custom plugin, hooks, and telemetry with OpenTelemetry.
+[examples/init](./examples/init) is a complete application on PostgreSQL and Gin. It shows migrations, a custom plugin, hooks, telemetry with OpenTelemetry, and sign-in with GitHub, Google, or another OpenID Connect provider when one is configured in its environment.
 
 ```bash
 cd examples/init
@@ -138,6 +138,7 @@ Migrations can be generated for PostgreSQL, MySQL, SQLite and SQL Server. MongoD
 | [SMS and one-time codes](./docs/api/sms.md) | The SMS sender plugins use, and the code manager |
 | [Magic link](./docs/api/magiclink.md) | Sign-in by emailed link: setup, sending the link, routes, redirects and rate limits |
 | [Two-factor authentication](./docs/api/twofactor.md) | A second factor at sign-in: TOTP, codes by email or SMS, recovery codes, the lock, routes and rate limits |
+| [OAuth](./docs/api/oauth.md) | Sign-in through an OAuth 2.0 or OpenID Connect provider: providers, the callback page, linking provider accounts, the provider's tokens, routes and rate limits |
 | [Email verification](./docs/api/emailverification.md) | Confirming a user's address: when a link is sent, routes, requiring a verified email, and changing an address safely |
 | [Mail](./docs/api/mail.md) | The mail sender plugins use, and waiting or background sends |
 | [Router adapters](./docs/api/routers.md) | Mounting the routes on `net/http`, Gin, Echo, chi or Fiber, and what is specific to each |
@@ -159,7 +160,6 @@ Migrations can be generated for PostgreSQL, MySQL, SQLite and SQL Server. MongoD
 Not built yet:
 
 - Password change for a signed-in user
-- Sign-in with an OAuth 2.0 or OpenID Connect provider
 
 ## Benchmarks
 
