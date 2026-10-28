@@ -80,6 +80,7 @@ Tags are never moved or deleted after they are pushed.
 
 ### Fixed
 
+- The command line saves each answer by replacing the draft file whole. It used to empty the file before writing it, so an interrupt during a save could leave an empty draft: the answers given were lost, and the next run failed to read the file. A program that read the draft during a save could also find it empty.
 - A session revoked while another request was writing it to the session cache could stay valid from the cache until it expired. This happened when the revoke landed between a lookup's read of the session and its cache write, or between an extension's write and its cache write. With the Redis adapter, a revoked session now stays revoked in the cache.
 
 ## Earlier versions

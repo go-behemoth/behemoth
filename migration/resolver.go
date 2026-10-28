@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -330,6 +331,10 @@ func (p *FilePresenter) readDraft() (draftFile, error) {
 	return df, nil
 }
 
+// writeDraft replaces the draft whole. A front-end saves after each answer,
+// and an editor or another front-end may read the file meanwhile, so a save
+// must never show them an empty file. An interrupt during a save leaves the
+// previous draft, with every answer saved before it.
 func (p *FilePresenter) writeDraft(df draftFile) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -338,7 +343,40 @@ func (p *FilePresenter) writeDraft(df draftFile) error {
 	if err := enc.Encode(df); err != nil {
 		return err
 	}
-	return os.WriteFile(p.path, buf.Bytes(), 0644)
+	return replaceFile(p.path, buf.Bytes(), 0644)
+}
+
+// replaceFile writes data to a temporary file in path's directory and renames
+// it over path. A rename within one file system is atomic, so path holds its
+// old contents or data, where os.WriteFile empties it before it writes. The
+// temporary name starts with a dot and no migration number, so the scans of
+// FolderPath skip it if a crash leaves it behind.
+func replaceFile(path string, data []byte, perm os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	// Synced before the rename, so that after a crash the name never points
+	// at data that did not reach the disk.
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(perm); err != nil { // CreateTemp makes it 0600
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // [Deferred] Format is plain JSON for a working v1 — no comments support,

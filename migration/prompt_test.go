@@ -296,3 +296,56 @@ func TestTheDraftKeepsTextAsWritten(t *testing.T) {
 		t.Errorf("the description was escaped:\n%s", b)
 	}
 }
+
+// A save replaces the draft whole, so a read while an answer is saved, by an
+// editor or a test, finds the old draft or the new one and never an empty
+// file. No temporary file is left next to it.
+func TestTheDraftIsNeverReadHalfWritten(t *testing.T) {
+	dir := t.TempDir()
+	file := NewFilePresenter(filepath.Join(dir, draftFileName))
+	if err := file.Present(context.Background(), []PlanIssue{question("email", "Apply alter", "Leave as-is")}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	saved := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				saved <- nil
+				return
+			default:
+			}
+			if err := file.answer("email", i%2); err != nil {
+				saved <- err
+				return
+			}
+		}
+	}()
+	var readErr error
+	for range 2000 {
+		if _, readErr = file.Questions(); readErr != nil {
+			break
+		}
+	}
+	close(stop)
+	if err := <-saved; err != nil {
+		t.Fatalf("saving an answer: %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("a read while an answer was saved: %v", readErr)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != draftFileName {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("files next to the draft: %v, want %s alone", names, draftFileName)
+	}
+}
