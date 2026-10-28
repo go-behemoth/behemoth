@@ -49,6 +49,8 @@ Tags are never moved or deleted after they are pushed.
 
 ## Unreleased
 
+## [0.2.0] - 2026-10-28
+
 ### Added
 
 - [Supported databases](docs/api/supported-databases.md) lists the minimum release of each database and the releases the tests run on: PostgreSQL 15, MySQL 8.4, SQL Server 2019, MongoDB 7.0, Redis 6.2 and SQLite 3.53.
@@ -83,3 +85,5 @@ Tags are never moved or deleted after they are pushed.
 ## Earlier versions
 
 `v0.1.0` to `v0.1.3` were published under `github.com/MastewalB/behemoth`. That path is deprecated, and `v0.1.3` carries the deprecation notice. They have no changelog entries.
+
+These versions are also listed under `github.com/go-behemoth/behemoth`, but their `go.mod` declares the old path, so they don't build at the new one. `v0.2.0` retracts them, so `go get` and `go list -m -versions` skip them.
