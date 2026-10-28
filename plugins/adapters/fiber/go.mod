@@ -3,7 +3,7 @@ module github.com/go-behemoth/behemoth/plugins/adapters/fiber
 go 1.26.0
 
 require (
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 	github.com/gofiber/fiber/v3 v3.6.1
 )
 
