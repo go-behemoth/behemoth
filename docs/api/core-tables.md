@@ -134,6 +134,7 @@ Use `ac.SessionManager`. It does more than the store, and a direct write skips w
 | `MaxConcurrent` and eviction of the oldest session | the session manager | The limit is not applied to your session. |
 | `CaptureIPAndAgent` | the session manager | IP address and user agent are stored even when the application turned capture off. |
 | The key-value cache | the session manager | A session you revoke directly stays valid from the cache until its entry expires. A session you create directly is not cached, which only costs a lookup. |
+| `version`, raised by one in each update, which is guarded on the version read (`Store.UpdateSessionAt`) | the store, called by the session manager | A direct update that leaves `version` as it is may not reach the session cache: the cache keeps the copy it holds of the same version until the session's next update through the manager. Two direct updates at once can overwrite each other. See [The session cache](sessions.md#the-session-cache). |
 | `auth.session.beforeCreate`, `afterCreate`, `beforeRevoke`, `afterRevoke` | the session manager | Other plugins are not told. A handler that vetoes sessions for a suspended user is bypassed. |
 | Terminal state rule (a revoked session stays revoked) | the session manager | A direct update can set a revoked session back to active. |
 

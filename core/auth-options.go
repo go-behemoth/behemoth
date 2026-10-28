@@ -21,6 +21,9 @@ const (
 	DefaultSessionPendingExpiresIn = 10 * time.Minute
 	// DefaultFreshAge is how long a session counts as fresh.
 	DefaultFreshAge = 15 * time.Minute
+	// DefaultUnversionedCacheTTL is how long a session stays in a session
+	// cache that can't order its writes.
+	DefaultUnversionedCacheTTL = time.Minute
 )
 
 // SessionConfig configures the session manager. The zero value works: a
@@ -60,8 +63,16 @@ type SessionConfig struct {
 	// only once the second factor has passed (SessionManager.Promote).
 	// Without eviction it is refused at once.
 	EvictOldestOnLimit bool
-	SecondaryStorage   behemoth.KeyValueStorage // nil = DB-only, no cache layer
-	CaptureIPAndAgent  bool
+	// UnversionedCacheTTL is how long a session stays in the session cache
+	// (BootConfig.KV) when the key-value storage can't order its writes:
+	// it doesn't implement VersionedCache. A revoke that races a cache
+	// write can leave the session valid from such a cache for this long.
+	// Default DefaultUnversionedCacheTTL, one minute. With a storage that
+	// implements VersionedCache, such as the Redis adapter, a session stays
+	// cached for its whole life, and the setting is not used.
+	UnversionedCacheTTL time.Duration
+	SecondaryStorage    behemoth.KeyValueStorage // nil = DB-only, no cache layer
+	CaptureIPAndAgent   bool
 }
 
 // WithDefaults returns c with every field left at zero set to its default.
@@ -77,6 +88,9 @@ func (c SessionConfig) WithDefaults() SessionConfig {
 	if c.FreshAge == 0 {
 		c.FreshAge = DefaultFreshAge
 	}
+	if c.UnversionedCacheTTL == 0 {
+		c.UnversionedCacheTTL = DefaultUnversionedCacheTTL
+	}
 	return c
 }
 
@@ -85,6 +99,7 @@ func (c SessionConfig) WithDefaults() SessionConfig {
 func (c SessionConfig) Validate() error {
 	for name, d := range map[string]time.Duration{
 		"ExpiresIn": c.ExpiresIn, "PendingExpiresIn": c.PendingExpiresIn, "UpdateAge": c.UpdateAge, "FreshAge": c.FreshAge,
+		"UnversionedCacheTTL": c.UnversionedCacheTTL,
 	} {
 		if d < 0 {
 			return fmt.Errorf("SessionConfig.%s is negative: %s", name, d)

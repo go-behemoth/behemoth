@@ -466,7 +466,7 @@ The limiter then counts as it does in production. A scenario that measures somet
 | 2 | Sign-in burst | 10, then 50, 100, 200, and 500 sign-ins at once | Peak RSS, out-of-memory kills, 5xx answers, and p99. It shows the bound of `crypto.PasswordLimit` at work: peak RSS stays flat as the burst grows, and what does not fit in `MaxWait` gets `503` with `server_busy`. |
 | 3 | Mixed workload | 1 sign-up for 10 sign-ins and 1,000 protected requests, for 30 minutes | p50, p95, and p99 per route. Error rate. Database calls per second. |
 | 4 | One hot counter | Many requests on one rate-limit key, with the database counter and with Redis | Rate-limit operations per check in `behemoth.store.duration`, where each lost race adds a read and a write. Checks that end in `error` in `behemoth.ratelimit.checks`, which fail open by default. |
-| 5 | Several replicas | Scenario 3 on two replicas, with sign-outs and revocations during the run | Counts shared across replicas. A revoked session refused on every replica within the cache's lifetime (M6). |
+| 5 | Several replicas | Scenario 3 on two replicas, with sign-outs and revocations during the run | Counts shared across replicas. A revoked session refused on every replica from the next request on, with Redis as the session cache ([ADR-0011](../decisions/0011-ordering-session-cache-writes-by-row-version.md)). |
 | 6 | Soak | Scenario 3 at half its sustainable rate, for 8 hours, with `Store.Purge` running | Heap after each collection, goroutines, open connections, the mail queue, table sizes, and how long a purge takes (L54). |
 | 7 | Slow database | Scenario 3, with 50 ms added to every PostgreSQL round trip by a proxy such as Toxiproxy | Pool exhaustion, queueing, and timeouts. How the latency of one call adds up in a flow. |
 
@@ -606,6 +606,5 @@ These entries in `docs/ongoing.md` affect the plan:
 - **L29, "The logger cannot say whether a level is enabled".** An allocation budget with a logger on the SQL adapter shows its cost.
 - **L54, "A purge deletes all of its rows in one statement".** The soak test measures a purge on tables that have grown.
 - **M1, "A link request for a known email takes longer than one for an unknown email".** The timing parity checks cover the flows it lists.
-- **M6, "A session revoked while it is being read can stay valid in the session cache".** Scenario 5 revokes sessions under load, with a cache.
 - **M12, "A data hook that reads before the write can fail with "database is locked" on SQLite".** Parallel benchmarks of writing flows on SQLite open the database with `_txlock=immediate`.
 - **M13, "The store does not retry on a deadlock error".** Load tests on MySQL and SQL Server may hit it.

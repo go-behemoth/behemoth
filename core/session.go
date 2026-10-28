@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	"github.com/go-behemoth/behemoth/models"
 )
@@ -91,6 +92,26 @@ type SessionManager interface {
 	// Revoke/RevokeAllForUser are meaningful or a no-op; false for purely
 	// stateless/self-verifying implementations.
 	SupportsRevocation() bool
+}
+
+// VersionedCache is an optional capability of a behemoth.KeyValueStorage: a
+// value that a write of an older version never replaces. The session manager
+// finds it by type assertion and keeps its cache of sessions through it, with
+// a session row's version (models.Session.Version). A copy of a session read
+// before a revoke then can't replace the revoked one, whatever order the two
+// writes reach the storage in. The Redis adapter has it. A storage without it
+// still caches sessions, for SessionConfig.UnversionedCacheTTL at most.
+type VersionedCache interface {
+	// SetIfNewer writes value under key with version, as one atomic step,
+	// unless key holds a value of the same or a later version, and reports
+	// whether it wrote. The value lives for ttl, which is at least a
+	// millisecond. A key that holds a value written by the storage's plain
+	// Set has no version, and is replaced.
+	SetIfNewer(ctx context.Context, key, value string, version int64, ttl time.Duration) (bool, error)
+
+	// GetVersioned returns the value SetIfNewer wrote under key, and its
+	// version. A key that holds none is a key-not-found error, as for Get.
+	GetVersioned(ctx context.Context, key string) (value string, version int64, err error)
 }
 
 // SessionRevokedUserDeleted is the revoke reason of a session that ended

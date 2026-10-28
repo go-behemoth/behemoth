@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -933,10 +934,16 @@ func TestAfterCommitCallbackPanicIsRecovered(t *testing.T) {
 }
 
 // memoryKV is a KeyValueStorage in a map, enough to act as the session cache.
+// It is a core.VersionedCache too, as the Redis adapter is. Wrap it in a
+// plainKV for a storage without the capability.
 type memoryKV struct {
-	mu      sync.Mutex
-	entries map[string]string
+	mu       sync.Mutex
+	entries  map[string]string
+	versions map[string]int64         // the version SetIfNewer wrote with an entry; none for Set's
+	ttls     map[string]time.Duration // the lifetime an entry was written with
 }
+
+var _ core.VersionedCache = (*memoryKV)(nil)
 
 func (k *memoryKV) Get(_ context.Context, key string) (string, error) {
 	k.mu.Lock()
@@ -948,10 +955,11 @@ func (k *memoryKV) Get(_ context.Context, key string) (string, error) {
 	return v, nil
 }
 
-func (k *memoryKV) Set(_ context.Context, key, value string, _ int) error {
+func (k *memoryKV) Set(_ context.Context, key, value string, ttl int) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.entries[key] = value
+	k.write(key, value, time.Duration(ttl)*time.Second)
+	delete(k.versions, key)
 	return nil
 }
 
@@ -959,14 +967,79 @@ func (k *memoryKV) Delete(_ context.Context, key string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	delete(k.entries, key)
+	delete(k.versions, key)
+	delete(k.ttls, key)
 	return nil
 }
 
-func (k *memoryKV) len() int {
+func (k *memoryKV) SetIfNewer(_ context.Context, key, value string, version int64, ttl time.Duration) (bool, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return len(k.entries)
+	if stored, ok := k.versions[key]; ok && stored >= version {
+		return false, nil
+	}
+	k.write(key, value, ttl)
+	if k.versions == nil {
+		k.versions = map[string]int64{}
+	}
+	k.versions[key] = version
+	return true, nil
 }
+
+func (k *memoryKV) GetVersioned(_ context.Context, key string) (string, int64, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	version, ok := k.versions[key]
+	if !ok {
+		return "", 0, errors.New("key not found")
+	}
+	return k.entries[key], version, nil
+}
+
+// write stores an entry. The caller holds mu.
+func (k *memoryKV) write(key, value string, ttl time.Duration) {
+	if k.entries == nil {
+		k.entries = map[string]string{}
+	}
+	if k.ttls == nil {
+		k.ttls = map[string]time.Duration{}
+	}
+	k.entries[key], k.ttls[key] = value, ttl
+}
+
+// clear drops every entry with its version, as a storage that evicts or
+// loses its keys does.
+func (k *memoryKV) clear() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	clear(k.entries)
+	clear(k.versions)
+	clear(k.ttls)
+}
+
+// session returns the copy of a session cached under its lookup hash, or nil
+// when the entry holds none: no entry, or a value that is not a session.
+func (k *memoryKV) session(lookupHash string) *models.Session {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var m models.Session
+	if json.Unmarshal([]byte(k.entries["session:"+lookupHash]), &m) != nil {
+		return nil
+	}
+	return &m
+}
+
+// ttl returns the lifetime the entry under a session's lookup hash was
+// written with.
+func (k *memoryKV) ttl(lookupHash string) time.Duration {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.ttls["session:"+lookupHash]
+}
+
+// plainKV hides the core.VersionedCache of the storage it wraps: a storage
+// that can't order its writes.
+type plainKV struct{ behemoth.KeyValueStorage }
 
 // The store reports a delete to its hooks around the rows it removes, in the
 // caller's transaction: a refusal or a failing after hook leaves every row,
@@ -1081,14 +1154,15 @@ func TestDeleteUserUnderBoot(t *testing.T) {
 
 	u := &models.User{Email: "ada@example.com"}
 	require.NoError(t, ac.Store.CreateUser(ctx, u))
-	_, live, err := ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionActive})
+	liveSession, live, err := ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionActive})
 	require.NoError(t, err)
 	old, _, err := ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionActive})
 	require.NoError(t, err)
 	require.NoError(t, ac.SessionManager.Revoke(ctx, old.ID, "user_logout"))
 	_, err = ac.SessionManager.Validate(ctx, live)
 	require.NoError(t, err)
-	require.Equal(t, 1, kv.len(), "the live session is cached")
+	require.NotNil(t, kv.session(liveSession.LookupHash), "the live session is cached")
+	require.Equal(t, models.SessionRevoked, kv.session(old.LookupHash).State, "the revoked session is cached as revoked")
 
 	// A handler on data.user.beforeDelete refuses: nothing changes.
 	seen, veto = nil, errs.NewInvalidInputError("billing", "user", "the user has an open invoice", nil)
@@ -1105,7 +1179,8 @@ func TestDeleteUserUnderBoot(t *testing.T) {
 		"afterRevoke tx=false revoked user_deleted at=true",
 		"deleted tx=false",
 	}, seen, "one afterRevoke: the session revoked earlier was reported then, and beforeRevoke does not fire")
-	assert.Zero(t, kv.len(), "the cache entry is gone")
+	assert.Nil(t, kv.session(liveSession.LookupHash), "the cache holds no copy of the deleted session")
+	assert.Nil(t, kv.session(old.LookupHash), "nor of the one revoked earlier")
 	_, err = ac.SessionManager.Validate(ctx, live)
 	assert.True(t, errs.IsNotFound(err), "the deleted user's token: %v", err)
 
@@ -1113,6 +1188,148 @@ func TestDeleteUserUnderBoot(t *testing.T) {
 	require.Len(t, deleted, 1)
 	assert.Equal(t, u.ID, deleted[0].SubjectID)
 	assert.Len(t, rec.Audit.OfType(string(hooks.HookSessionAfterRevoke)), 2, "the sign-out earlier, and the session that ended with the user")
+}
+
+// A lookup that read a session before its user was deleted can't put it
+// back in the cache. Evict deletes the entry in the delete's transaction, and
+// Discard, after the commit, leaves a gone value that no copy of the session
+// can replace. See ADR-0011.
+func TestDeletedUsersSessionStaysOutOfTheCache(t *testing.T) {
+	ctx := context.Background()
+	app, err := engine.Prepare(nil, engine.PrepareConfig{})
+	require.NoError(t, err)
+	sqlDB, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "delete.db")+"?_foreign_keys=on&_busy_timeout=10000")
+	require.NoError(t, err)
+	t.Cleanup(func() { sqlDB.Close() })
+	createTables(t, sqliteAdapter.NewSQLiteDriver(sqlDB, app.Resolver), app.Schemas.All())
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	ac, err := engine.Boot(ctx, app, sqliteAdapter.NewSQLiteAdapter(sqlDB, app.Resolver), engine.BootConfig{
+		Crypto: crypto.Config{
+			Secrets: crypto.StaticSecretSource{Secrets: map[int]string{1: strings.Repeat("ab", 32)}, Current: 1},
+		},
+		Session: core.SessionConfig{ExpiresIn: time.Hour},
+		KV:      kv,
+	})
+	require.NoError(t, err)
+
+	u := &models.User{Email: "ada@example.com"}
+	require.NoError(t, ac.Store.CreateUser(ctx, u))
+	sess, raw, err := ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	kv.clear() // the entry is evicted, so the next lookup reads the row
+
+	kv.beforeSet = func() { require.NoError(t, ac.Store.DeleteUser(ctx, u.ID)) }
+	_, err = ac.SessionManager.Validate(ctx, raw)
+	require.NoError(t, err, "the lookup that read the row before the delete succeeds")
+	require.Nil(t, kv.beforeSet, "the user was deleted between the read and the cache write")
+
+	assert.Nil(t, kv.session(sess.LookupHash), "the cache holds no copy of the session")
+	assert.Equal(t, time.Hour, kv.ttl(sess.LookupHash), "the gone value outlives any copy of the session")
+	_, err = ac.SessionManager.Validate(ctx, raw)
+	assert.True(t, errs.IsNotFound(err), "the deleted user's token: %v", err)
+}
+
+// pausingDB is a database that runs a function once, just before its next
+// delete of sessions, in a transaction or not. It puts a concurrent
+// operation between Store.DeleteUser's list of a user's sessions and its
+// delete of them.
+type pausingDB struct {
+	behemoth.Database
+	pause *func() // shared with the databases of its transactions
+}
+
+func newPausingDB(db behemoth.Database) *pausingDB {
+	return &pausingDB{Database: db, pause: new(func())}
+}
+
+// beforeSessionsDelete sets the function to run.
+func (d *pausingDB) beforeSessionsDelete(f func()) { *d.pause = f }
+
+func (d *pausingDB) DeleteMany(ctx context.Context, m behemoth.Model, expr clause.Expression) error {
+	if _, ok := m.(*models.Session); ok {
+		if f := *d.pause; f != nil {
+			*d.pause = nil
+			f()
+		}
+	}
+	return d.Database.DeleteMany(ctx, m, expr)
+}
+
+func (d *pausingDB) Transaction(ctx context.Context, fn behemoth.TransactionFunc) error {
+	return d.Database.Transaction(ctx, func(ctx context.Context, tx behemoth.Database) (any, error) {
+		return fn(ctx, &pausingDB{Database: tx, pause: d.pause})
+	})
+}
+
+// A session that starts, or moves to a new token, between Store.DeleteUser's
+// list of the user's sessions and its delete of them keeps working from the
+// session cache after the delete (docs/ongoing.md, M35). The delete removes
+// its row by user_id, but the cache entries it ends are those of the
+// sessions it listed, under the tokens they had then. The test fails until
+// that is fixed.
+//
+// It runs on PostgreSQL and MySQL, where another connection can write the
+// user's sessions while the delete's transaction is open, until the delete
+// reaches them.
+func TestSessionsChangedDuringTheirUsersDeletionStayOutOfTheCache(t *testing.T) {
+	t.Skip("M35")
+	for _, backend := range []string{"sql/postgres", "sql/mysql"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			app, err := engine.Prepare(nil, engine.PrepareConfig{})
+			require.NoError(t, err)
+			db := newPausingDB(contractBackends()[backend](t, app.Schemas.All(), app.Resolver))
+			ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
+				Crypto: crypto.Config{
+					Secrets: crypto.StaticSecretSource{Secrets: map[int]string{1: strings.Repeat("ab", 32)}, Current: 1},
+				},
+				Session: core.SessionConfig{ExpiresIn: time.Hour},
+				KV:      &memoryKV{},
+			})
+			require.NoError(t, err)
+
+			t.Run("a promotion", func(t *testing.T) {
+				u := &models.User{Email: "ada@example.com"}
+				require.NoError(t, ac.Store.CreateUser(ctx, u))
+				pending, _, err := ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionPending})
+				require.NoError(t, err)
+
+				var raw string
+				db.beforeSessionsDelete(func() {
+					var err error
+					_, raw, err = ac.SessionManager.Promote(ctx, pending.ID, core.FactorTOTP)
+					require.NoError(t, err, "the second factor passes, and the session moves to a new token")
+				})
+				require.NoError(t, ac.Store.DeleteUser(ctx, u.ID))
+				require.NotEmpty(t, raw, "the promotion ran between the delete's list and its delete")
+				_, err = ac.Store.FindSessionByID(ctx, pending.ID)
+				require.True(t, errs.IsNotFound(err), "the delete removed the promoted session's row: %v", err)
+
+				_, err = ac.SessionManager.Validate(ctx, raw)
+				assert.True(t, errs.IsNotFound(err), "the token the promotion gave out: %v", err)
+			})
+
+			t.Run("a sign-in", func(t *testing.T) {
+				u := &models.User{Email: "grace@example.com"}
+				require.NoError(t, ac.Store.CreateUser(ctx, u))
+
+				var sess *models.Session
+				var raw string
+				db.beforeSessionsDelete(func() {
+					var err error
+					sess, raw, err = ac.SessionManager.Create(ctx, u.ID, core.SessionMeta{State: models.SessionActive})
+					require.NoError(t, err, "a sign-in creates its session")
+				})
+				require.NoError(t, ac.Store.DeleteUser(ctx, u.ID))
+				require.NotNil(t, sess, "the sign-in ran between the delete's list and its delete")
+				_, err = ac.Store.FindSessionByID(ctx, sess.ID)
+				require.True(t, errs.IsNotFound(err), "the delete removed the new session's row: %v", err)
+
+				_, err = ac.SessionManager.Validate(ctx, raw)
+				assert.True(t, errs.IsNotFound(err), "the token of the sign-in: %v", err)
+			})
+		})
+	}
 }
 
 // Under Boot the notifications are the data.user.created and

@@ -35,6 +35,7 @@ const (
 	SessionImpersonatorID = "impersonator_id"
 	SessionRevokedAt      = "revoked_at"
 	SessionRevokedReason  = "revoked_reason"
+	SessionVersion        = "version"
 	SessionCreatedAt      = "created_at"
 	SessionUpdatedAt      = "updated_at"
 )
@@ -44,7 +45,7 @@ const (
 var sessionColumns = columnSet(SessionID, SessionUserID, SessionLookupHash, SessionTokenHash,
 	SessionKeyVersion, SessionStateColumn, SessionExpiresAt, SessionLastActiveAt, SessionFreshAt, SessionFactors,
 	SessionIPAddress, SessionUserAgent, SessionImpersonatorID, SessionRevokedAt, SessionRevokedReason,
-	SessionCreatedAt, SessionUpdatedAt)
+	SessionVersion, SessionCreatedAt, SessionUpdatedAt)
 
 type Session struct {
 	Extension
@@ -63,6 +64,12 @@ type Session struct {
 	ImpersonatorID any          `db:"impersonator_id"` // nullable; set when an admin is impersonating this session's user
 	RevokedAt      *time.Time   `db:"revoked_at"`      // nullable; session soft-revoked, row kept for audit
 	RevokedReason  string       `db:"revoked_reason"`  // "user_logout" | "admin_revoked" | "password_changed" | etc...
+
+	// Version counts the updates of the row: Store.UpdateSessionAt writes
+	// each one with the next version, guarded on the one it read. A copy of
+	// the row carries the version of its contents, which is how the session
+	// cache keeps the newest copy whatever order the copies reach it in.
+	Version int64 `db:"version"`
 
 	CreatedAt time.Time `db:"created_at"`
 	UpdatedAt time.Time `db:"updated_at"`
@@ -111,6 +118,7 @@ func (s *Session) FromMap(m map[string]any) error {
 		s.RevokedAt = &t
 	}
 	s.RevokedReason, _ = m[SessionRevokedReason].(string)
+	s.Version, _ = m[SessionVersion].(int64) // a document written before the column existed has none: version 0
 	s.CreatedAt, _ = m[SessionCreatedAt].(time.Time)
 	s.UpdatedAt, _ = m[SessionUpdatedAt].(time.Time)
 	s.collectExtras(m, sessionColumns)
@@ -149,6 +157,7 @@ func (s *Session) ToMap() (map[string]any, error) {
 		SessionImpersonatorID: s.ImpersonatorID,
 		SessionRevokedAt:      revokedAt,
 		SessionRevokedReason:  s.RevokedReason,
+		SessionVersion:        s.Version,
 		SessionCreatedAt:      s.CreatedAt,
 		SessionUpdatedAt:      s.UpdatedAt,
 	}), nil

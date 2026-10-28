@@ -12,7 +12,7 @@ Behemoth supports a release while its maker publishes security fixes for it. Whe
 | MySQL | 8.4 | 8.4, 9 | The tests also pass on 8.0, whose maker ended support in April 2026. MariaDB is not supported. |
 | SQL Server | 2019 | 2019, 2022 | The adapter uses nothing newer than SQL Server 2016. Releases before 2019 are not tested. |
 | MongoDB | 7.0 | 7.0 | The tests also pass on 6.0. A replica set is required. See [MongoDB](./mongodb.md). |
-| Redis | 6.2 | 6.2, 7.2, 8 | The adapter uses `GET`, `SET` with an expiry, and `DEL`. |
+| Redis | 6.2 | 6.2, 7.2, 8 | The adapter uses `GET`, `SET` with an expiry, `DEL`, and `HMGET`, and runs Lua scripts for the rate-limit counters and the session cache. A Redis user that an ACL restricts needs the scripting commands. |
 | SQLite | 3.53 | 3.53 | The SQLite library comes with the driver. See [SQLite](#sqlite). |
 
 "Tested on" lists the releases the full suite of storage and store tests ran on without a failure. The releases between a minimum and a tested release are supported but not tested one by one.

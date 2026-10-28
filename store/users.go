@@ -58,7 +58,7 @@ func (s *Store) FindUserBy(ctx context.Context, column string, value any) (*mode
 // stamps updated_at, and returns the stored user. The caller's map is never
 // modified.
 func (s *Store) UpdateUser(ctx context.Context, id string, updates behemoth.M) (*models.User, error) {
-	updated, err := s.update(ctx, &models.User{}, id, updates, models.UserUpdatedAt, normalizeUserRow)
+	updated, err := s.update(ctx, &models.User{}, id, updates, models.UserUpdatedAt, normalizeUserRow, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -73,8 +73,9 @@ func (s *Store) UpdateUser(ctx context.Context, id string, updates behemoth.M) (
 // address since. A user with another email gets a NotFound error, as a
 // missing one does.
 func (s *Store) UpdateUserIfEmail(ctx context.Context, id, email string, updates behemoth.M) (*models.User, error) {
-	updated, err := s.update(ctx, &models.User{}, id, updates, models.UserUpdatedAt, normalizeUserRow,
-		clause.Condition{Field: models.UserEmail, Operator: clause.OpEqual, Value: email})
+	updated, err := s.update(ctx, &models.User{}, id, updates, models.UserUpdatedAt, normalizeUserRow, &clause.Expression{
+		Conditions: []clause.Condition{{Field: models.UserEmail, Operator: clause.OpEqual, Value: email}},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +122,9 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 			return err // the hook's error is the abort; returned as-is
 		}
 
+		// A session that a promotion moves to a new token, or a sign-in
+		// creates, after this list and before the delete below keeps its
+		// cache entry: docs/ongoing.md, M35.
 		sessions, err := tx.ListSessionsForUser(ctx, id)
 		if err != nil {
 			return err

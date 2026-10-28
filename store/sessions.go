@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-behemoth/behemoth"
 	"github.com/go-behemoth/behemoth/clause"
+	"github.com/go-behemoth/behemoth/errs"
 	"github.com/go-behemoth/behemoth/models"
 )
 
@@ -28,28 +29,43 @@ func (s *Store) FindSessionByLookupHash(ctx context.Context, lookupHash string) 
 	return s.findSession(ctx, eq(models.SessionLookupHash, lookupHash))
 }
 
-// UpdateSession applies changes (canonical column names) to the session with
-// id, stamps updated_at, and returns the stored session.
-func (s *Store) UpdateSession(ctx context.Context, id string, changes behemoth.M) (*models.Session, error) {
-	updated, err := s.update(ctx, &models.Session{}, id, changes, models.SessionUpdatedAt, nil)
+// UpdateSessionAt applies changes (canonical column names) to the session
+// with id if the session is still at version when the change is written. It
+// stamps updated_at, writes version+1, and returns the stored session. The
+// version is checked in the write itself (UpdateOne re-checks its
+// expression), so of several calls that read the session at one version,
+// one writes. A session at another version gets a NotFound error, as a
+// missing one does.
+//
+// It is the store's only update of a session row. Every update writes the
+// next version, which is how the session cache keeps the newest copy of a
+// session whatever order the copies reach it in. changes can't name the
+// version, and a BeforeUpdate hook can't change it.
+func (s *Store) UpdateSessionAt(ctx context.Context, id string, version int64, changes behemoth.M) (*models.Session, error) {
+	if _, ok := changes[models.SessionVersion]; ok {
+		return nil, errs.NewValidationError("Store.UpdateSessionAt", models.SessionTable,
+			fmt.Errorf("the store writes %q, changes can't", models.SessionVersion))
+	}
+	next := func(row behemoth.M) { row[models.SessionVersion] = version + 1 } // after the hooks
+	updated, err := s.update(ctx, &models.Session{}, id, changes, models.SessionUpdatedAt, next, sessionAt(version))
 	if err != nil {
 		return nil, err
 	}
 	return updated.(*models.Session), nil
 }
 
-// UpdateSessionIn is UpdateSession for a session that is in state when the
-// change is written. The state is checked in the write itself (UpdateOne
-// re-checks its expression), so of several calls that move one session out
-// of a state at once, one does. A session in another state gets a NotFound
-// error, as a missing one does.
-func (s *Store) UpdateSessionIn(ctx context.Context, id string, state models.SessionState, changes behemoth.M) (*models.Session, error) {
-	updated, err := s.update(ctx, &models.Session{}, id, changes, models.SessionUpdatedAt, nil,
-		clause.Condition{Field: models.SessionStateColumn, Operator: clause.OpEqual, Value: string(state)})
-	if err != nil {
-		return nil, err
+// sessionAt is the guard of a session row at version. A row stored before
+// the version column existed is at version 0: an SQL migration gives it the
+// column's default, and a MongoDB document has no such field, which the
+// guard for 0 matches too.
+func sessionAt(version int64) *clause.Expression {
+	at := clause.Condition{Field: models.SessionVersion, Operator: clause.OpEqual, Value: version}
+	if version != 0 {
+		return &clause.Expression{Conditions: []clause.Condition{at}}
 	}
-	return updated.(*models.Session), nil
+	return &clause.Expression{Logic: clause.OpOr, Conditions: []clause.Condition{
+		at, {Field: models.SessionVersion, Operator: clause.OpIsNull},
+	}}
 }
 
 // CountActiveSessions counts userID's sessions that are active and have not

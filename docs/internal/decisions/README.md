@@ -157,3 +157,4 @@ Keep this list current, newest last.
 | [0008](0008-renewing-the-session-token-on-promotion.md) | Renew the session token when a pending session becomes active | Proposed |
 | [0009](0009-recording-the-factors-of-a-session.md) | Record on each session the factors that authenticated it | Accepted |
 | [0010](0010-bounding-concurrent-password-hashes.md) | Bound the password hashes that run at once in the hasher | Proposed |
+| [0011](0011-ordering-session-cache-writes-by-row-version.md) | Order the session cache's writes by a version on the session row | Accepted |

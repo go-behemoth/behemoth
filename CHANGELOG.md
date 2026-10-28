@@ -52,6 +52,8 @@ Tags are never moved or deleted after they are pushed.
 ### Added
 
 - [Supported databases](docs/api/supported-databases.md) lists the minimum release of each database and the releases the tests run on: PostgreSQL 15, MySQL 8.4, SQL Server 2019, MongoDB 7.0, Redis 6.2 and SQLite 3.53.
+- `core.VersionedCache`, a capability of a key-value storage that keeps the latest version of a value whatever order the writes arrive in. The session cache uses it when `BootConfig.KV` has it, and the Redis adapter does. See [The session cache](docs/api/sessions.md#the-session-cache).
+- `SessionConfig.UnversionedCacheTTL`, one minute by default: how long a session stays in a session cache whose storage doesn't implement `core.VersionedCache`.
 
 ### Security
 
@@ -67,6 +69,16 @@ Tags are never moved or deleted after they are pushed.
 - The OpenTelemetry instrumentation scope of the `otel` adapter is now `github.com/go-behemoth/behemoth`. Update a dashboard or a filter that selects spans or metrics by the old scope name.
 - The `go` line of every module is `1.26.0`, the oldest Go release Behemoth supports. Earlier versions named a patch release, which made `go` fetch that exact toolchain. Behemoth supports the two newest Go releases, and CI tests with the newest patch of each. Build your application with the newest patch release of your Go version, because the standard library receives security fixes in patch releases.
 - Each adapter module requires the matching release of the core module, so `go get` installs an adapter on its own. Earlier adapter modules required a version that doesn't exist.
+- The `sessions` table has a new column, `version`, which every update of a session raises by one. Generate and apply a migration before you deploy this version. Existing sessions get version 0. On MongoDB, sessions stored without the field read as version 0 and need nothing.
+- With a key-value storage that doesn't implement `core.VersionedCache`, a session stays in the session cache for `SessionConfig.UnversionedCacheTTL` at most, instead of until it expires. A session in use is then read from the database about once a minute.
+
+### Removed
+
+- `Store.UpdateSession` and `Store.UpdateSessionIn`. Use `Store.UpdateSessionAt`, which writes a change only if the session is still at the version you read, and raises the version.
+
+### Fixed
+
+- A session revoked while another request was writing it to the session cache could stay valid from the cache until it expired. This happened when the revoke landed between a lookup's read of the session and its cache write, or between an extension's write and its cache write. With the Redis adapter, a revoked session now stays revoked in the cache.
 
 ## Earlier versions
 

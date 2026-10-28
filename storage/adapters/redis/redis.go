@@ -6,6 +6,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-behemoth/behemoth/errs"
@@ -17,7 +18,9 @@ import (
 //
 // It also counts for the rate limiter (Increment, the
 // core.AtomicIncrementer capability), so with Redis configured rate-limit
-// counters are kept there and not in the database.
+// counters are kept there and not in the database. And it keeps versioned
+// values (SetIfNewer and GetVersioned, the core.VersionedCache capability),
+// which the session manager caches sessions with.
 type RedisAdapter struct {
 	redisClient *redis.Client
 }
@@ -108,6 +111,68 @@ func (rkv *RedisAdapter) Increment(ctx context.Context, key string, ttl time.Dur
 		return 0, time.Time{}, fmt.Errorf("redis: the increment script returned %d values, want 2", len(res))
 	}
 	return res[0], time.Now().Add(time.Duration(res[1]) * time.Millisecond), nil
+}
+
+// versionedSetScript writes a value with its version unless the key holds
+// one of the same or a later version. The key is a hash of the two fields,
+// so that the version is compared and written in one step, and its expiry
+// is set in the same step. A key of another type holds a value the plain Set
+// wrote, which has no version and is replaced. Lua compares the versions as
+// numbers with 53 bits of precision, far more than a row is ever updated.
+var versionedSetScript = redis.NewScript(`
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind == 'hash' then
+	local stored = tonumber(redis.call('HGET', KEYS[1], 'version'))
+	if stored and stored >= tonumber(ARGV[2]) then
+		return 0
+	end
+elseif kind ~= 'none' then
+	redis.call('DEL', KEYS[1])
+end
+redis.call('HSET', KEYS[1], 'version', ARGV[2], 'value', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[3])
+return 1
+`)
+
+// SetIfNewer implements core.VersionedCache: it writes value under key with
+// version, unless key holds a value of the same or a later version, and
+// reports whether it wrote. The value lives for ttl.
+func (rkv *RedisAdapter) SetIfNewer(ctx context.Context, key, value string, version int64, ttl time.Duration) (bool, error) {
+	const op = "SetIfNewer"
+	if key == "" {
+		return false, errs.NewEmptyKey(op, nil)
+	}
+	if ttl < time.Millisecond {
+		return false, errs.NewValidationError(op, EntityKVPair, fmt.Errorf("the lifetime must be at least a millisecond, got %s", ttl))
+	}
+	wrote, err := versionedSetScript.Run(ctx, rkv.redisClient, []string{key}, value, version, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, adapters.WrapWithCaller(err, EntityKVPair, handleRedisError)
+	}
+	return wrote == 1, nil
+}
+
+// GetVersioned implements core.VersionedCache: it returns the value
+// SetIfNewer wrote under key, and its version.
+func (rkv *RedisAdapter) GetVersioned(ctx context.Context, key string) (string, int64, error) {
+	const op = "GetVersioned"
+	if key == "" {
+		return "", 0, errs.NewEmptyKey(op, nil)
+	}
+	fields, err := rkv.redisClient.HMGet(ctx, key, "version", "value").Result()
+	if err != nil {
+		return "", 0, adapters.WrapWithCaller(err, EntityKVPair, handleRedisError)
+	}
+	stored, hasVersion := fields[0].(string)
+	value, hasValue := fields[1].(string)
+	if !hasVersion || !hasValue {
+		return "", 0, errs.NewKeyNotFound(op, nil)
+	}
+	version, err := strconv.ParseInt(stored, 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("redis: the version under %q is not a number: %w", key, err)
+	}
+	return value, version, nil
 }
 
 // EntityKVPair is the entity name reported in errors about a key.
