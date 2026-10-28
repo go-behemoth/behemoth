@@ -22,3 +22,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// These versions declare the old module path, github.com/MastewalB/behemoth, and don't build at this one.
+retract [v0.1.0, v0.1.3]
