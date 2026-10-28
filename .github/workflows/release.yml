@@ -2,10 +2,11 @@
 #
 # The script tags the root module `vX.Y.Z` and every submodule `DIR/vX.Y.Z`.
 # A `*` in a tag filter does not match `/`, so only the root tag starts this
-# workflow, and one version gets one release. The release notes are the
-# version's section of CHANGELOG.md, so the script refuses to tag a version
-# that has none. A version with a suffix, such as v0.3.0-rc.1, is a
-# pre-release.
+# workflow, and one version gets one release. GitHub starts no workflow for a
+# push of more than three tags, so the script pushes the root tag on its own,
+# after the submodule tags. The release notes are the version's section of
+# CHANGELOG.md, so the script refuses to tag a version that has none. A
+# version with a suffix, such as v0.3.0-rc.1, is a pre-release.
 
 name: Release
 
