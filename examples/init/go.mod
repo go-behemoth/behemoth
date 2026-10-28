@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 	github.com/go-behemoth/behemoth/plugins/adapters/gin v0.0.0
 	github.com/go-behemoth/behemoth/storage/adapters/postgres v0.0.0
 	github.com/go-behemoth/behemoth/telemetry/adapters/otel v0.0.0

@@ -3,7 +3,7 @@ module github.com/go-behemoth/behemoth/tests
 go 1.26.0
 
 require (
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 	github.com/go-behemoth/behemoth/storage/adapters/bun v0.0.0
 	github.com/go-behemoth/behemoth/storage/adapters/gorm v0.0.0
 	github.com/go-behemoth/behemoth/storage/adapters/mongo v0.0.0

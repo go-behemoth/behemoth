@@ -6,7 +6,7 @@ replace github.com/go-behemoth/behemoth => ../../../
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 )
 
 require (

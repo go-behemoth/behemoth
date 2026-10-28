@@ -3,7 +3,7 @@ module github.com/go-behemoth/behemoth/storage/adapters/mongo
 go 1.26.0
 
 require (
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 	go.mongodb.org/mongo-driver v1.17.10
 )
 

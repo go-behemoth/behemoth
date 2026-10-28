@@ -3,7 +3,7 @@ module github.com/go-behemoth/behemoth/storage/adapters/gorm
 go 1.26.0
 
 require (
-	github.com/go-behemoth/behemoth v0.0.0
+	github.com/go-behemoth/behemoth v0.2.0
 	gorm.io/gorm v1.31.2
 )
 
