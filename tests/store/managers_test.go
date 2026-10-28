@@ -24,6 +24,7 @@ import (
 	"github.com/go-behemoth/behemoth/identity"
 	"github.com/go-behemoth/behemoth/models"
 	pgAdapter "github.com/go-behemoth/behemoth/storage/adapters/postgres"
+	redisAdapter "github.com/go-behemoth/behemoth/storage/adapters/redis"
 	sqliteAdapter "github.com/go-behemoth/behemoth/storage/adapters/sqlite"
 	"github.com/go-behemoth/behemoth/store"
 	"github.com/go-behemoth/behemoth/telemetry/telemetrytest"
@@ -37,7 +38,7 @@ CREATE TABLE sessions (
 	id TEXT PRIMARY KEY, user_id TEXT NOT NULL, lookup_hash TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL,
 	key_version INTEGER NOT NULL, state TEXT NOT NULL, expires_at TIMESTAMP NOT NULL, last_active_at TIMESTAMP,
 	fresh_at TIMESTAMP, factors TEXT, ip_address TEXT, user_agent TEXT, impersonator_id TEXT, revoked_at TIMESTAMP,
-	revoked_reason TEXT, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);
+	revoked_reason TEXT, version INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);
 CREATE TABLE tokens (
 	id TEXT PRIMARY KEY, kind TEXT NOT NULL, subject TEXT, lookup_hash TEXT NOT NULL, token_hash TEXT NOT NULL,
 	key_version INTEGER NOT NULL, metadata TEXT, expires_at TIMESTAMP, consumed_at TIMESTAMP, revoked_at TIMESTAMP,
@@ -278,6 +279,375 @@ func TestSessionTouchDecidesFromTheSessionItIsGiven(t *testing.T) {
 	assert.Nil(t, extended, "a revoked session is not extended")
 
 	// Due by the copy and by the row is TestSessionTouchExtendsExpiry.
+}
+
+// interleavingKV is a session cache that runs beforeSet once, at the next
+// write, before the write lands. It puts a concurrent operation between a
+// manager's database read or write and the cache write that follows it,
+// without depending on timing.
+type interleavingKV struct {
+	*memoryKV
+	beforeSet func()
+}
+
+func (k *interleavingKV) interleave() {
+	if f := k.beforeSet; f != nil {
+		k.beforeSet = nil
+		f()
+	}
+}
+
+func (k *interleavingKV) Set(ctx context.Context, key, value string, ttl int) error {
+	k.interleave()
+	return k.memoryKV.Set(ctx, key, value, ttl)
+}
+
+func (k *interleavingKV) SetIfNewer(ctx context.Context, key, value string, version int64, ttl time.Duration) (bool, error) {
+	k.interleave()
+	return k.memoryKV.SetIfNewer(ctx, key, value, version, ttl)
+}
+
+// A revoke that lands while a cache miss is being served takes effect. Get
+// reads the row and then writes it to the cache, and the revoke updates the
+// row and the cache between the two. The revoked copy has the later
+// version, so the active copy the Get read can't replace it. See ADR-0011.
+func TestSessionRevokedDuringACacheMissIsRefused(t *testing.T) {
+	ctx := context.Background()
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour}, &passDispatcher{}, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	kv.clear() // the entry Create wrote is evicted, so the next Get misses
+
+	kv.beforeSet = func() { require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout")) }
+	_, err = sm.Get(ctx, raw)
+	require.NoError(t, err, "the Get that read the row before the revoke succeeds")
+	require.Nil(t, kv.beforeSet, "the revoke ran between the read and the cache write")
+
+	assert.Equal(t, map[string]models.SessionState{sess.ID: models.SessionRevoked}, sessionStates(t, sm, "u1"), "the row is revoked")
+	_, err = sm.Get(ctx, raw)
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "a Get after the revoke is refused: %v", err)
+}
+
+// The same race through Touch, which needs no cache miss: it writes the row
+// it extended to the cache, and a revoke lands between its write and the
+// cache write. See ADR-0011.
+func TestSessionRevokedDuringATouchIsRefused(t *testing.T) {
+	ctx := context.Background()
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, UpdateAge: 2 * time.Hour}, // always due
+		&passDispatcher{}, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	_, err = sm.Get(ctx, raw)
+	require.NoError(t, err, "the session is in the cache")
+
+	kv.beforeSet = func() { require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout")) }
+	extended, err := sm.Touch(ctx, sess)
+	require.NoError(t, err)
+	require.NotNil(t, extended, "Touch extended the session before the revoke")
+	require.Nil(t, kv.beforeSet, "the revoke ran between Touch's write and the cache write")
+
+	assert.Equal(t, map[string]models.SessionState{sess.ID: models.SessionRevoked}, sessionStates(t, sm, "u1"), "the row is revoked")
+	_, err = sm.Get(ctx, raw)
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "a Get after the revoke is refused: %v", err)
+}
+
+// A Get of the pending token that read the session before its promotion
+// can't put the pending copy back. The promotion leaves a gone value under
+// the pending token, of a later version than the copy, which lives as long
+// as the pending session would have. See ADR-0011.
+func TestSessionPromotedDuringACacheMissStaysGone(t *testing.T) {
+	ctx := context.Background()
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: 5 * time.Minute}, &passDispatcher{}, nil, managersAuth)
+	pending, pendingRaw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionPending})
+	require.NoError(t, err)
+	kv.clear()
+
+	var raw string
+	kv.beforeSet = func() {
+		var err error
+		_, raw, err = sm.Promote(ctx, pending.ID, core.FactorTOTP)
+		require.NoError(t, err)
+	}
+	_, err = sm.Get(ctx, pendingRaw)
+	require.NoError(t, err, "the Get that read the row before the promotion succeeds")
+	require.Nil(t, kv.beforeSet, "the promotion ran between the read and the cache write")
+
+	_, err = sm.Get(ctx, pendingRaw)
+	assert.True(t, errs.IsNotFound(err), "the pending token stops working: %v", err)
+	assert.Nil(t, kv.session(pending.LookupHash), "no copy of the session under the pending token")
+	assert.Greater(t, kv.ttl(pending.LookupHash), 4*time.Minute)
+	assert.LessOrEqual(t, kv.ttl(pending.LookupHash), 5*time.Minute, "the gone value lives as long as the pending session would have")
+	_, err = sm.Validate(ctx, raw)
+	assert.NoError(t, err, "the new token works")
+}
+
+// A Get that read a session before a Touch can't replace the extended copy
+// with the earlier expiry, so the cache never expires a session sooner than
+// its row does. See ADR-0011.
+func TestSessionExtendedDuringACacheMissKeepsItsExpiry(t *testing.T) {
+	ctx := context.Background()
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, UpdateAge: 2 * time.Hour}, // always due
+		&passDispatcher{}, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	kv.clear()
+
+	var extended *models.Session
+	kv.beforeSet = func() {
+		var err error
+		extended, err = sm.Touch(ctx, sess)
+		require.NoError(t, err)
+		require.NotNil(t, extended)
+	}
+	_, err = sm.Get(ctx, raw)
+	require.NoError(t, err)
+	require.Nil(t, kv.beforeSet, "the Touch ran between the Get's read and its cache write")
+
+	cached := kv.session(sess.LookupHash)
+	require.NotNil(t, cached)
+	assert.Equal(t, extended.Version, cached.Version, "the extended copy stays")
+	assert.True(t, cached.ExpiresAt.Equal(extended.ExpiresAt), "with the extended expiry")
+}
+
+// Every update of a session row writes the next version, and an update
+// from an earlier version is refused. Of several Touches of one session at
+// once, one extends it, and the others give up. See ADR-0011.
+func TestSessionUpdatesAreVersioned(t *testing.T) {
+	ctx := context.Background()
+	st := store.New(sessionsTokensDB(t))
+	sm := auth.NewSessionManager(st, nil, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: 5 * time.Minute, UpdateAge: 2 * time.Hour}, // always due
+		&passDispatcher{}, nil, managersAuth)
+
+	pending, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionPending})
+	require.NoError(t, err)
+	assert.Zero(t, pending.Version)
+	extended, err := sm.Touch(ctx, pending)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, extended.Version, "a Touch")
+	promoted, _, err := sm.Promote(ctx, pending.ID, core.FactorTOTP)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, promoted.Version, "a promotion")
+	require.NoError(t, sm.Revoke(ctx, pending.ID, "user_logout"))
+	revoked, err := st.FindSessionByID(ctx, pending.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, revoked.Version, "a revoke")
+
+	_, err = st.UpdateSessionAt(ctx, pending.ID, 2, behemoth.M{models.SessionRevokedReason: "late"})
+	assert.True(t, errs.IsNotFound(err), "an update from an earlier version: %v", err)
+	_, err = st.UpdateSessionAt(ctx, pending.ID, 3, behemoth.M{models.SessionVersion: int64(9)})
+	assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "the store writes the version: %v", err)
+
+	// A session in its last minute, with extensions due in the last half
+	// hour: once extended, it is not due again.
+	rolling := auth.NewSessionManager(st, nil, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, UpdateAge: 30 * time.Minute}, &passDispatcher{}, nil, managersAuth)
+	sess, _, err := rolling.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	sess, err = st.UpdateSessionAt(ctx, sess.ID, sess.Version, behemoth.M{models.SessionExpiresAt: st.Now().Add(time.Minute)})
+	require.NoError(t, err)
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			extended, err := rolling.Touch(ctx, sess)
+			assert.NoError(t, err, "a Touch that loses gives up without an error")
+			if extended != nil {
+				wins.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), wins.Load(), "one Touch extends the session")
+	stored, err := st.FindSessionByID(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, stored.Version, "the expiry set above, and the one extension")
+}
+
+// interceptDispatcher is a passDispatcher that runs a function once, at the
+// first before chain of a point: a concurrent update that lands between a
+// manager's read of a session and its write.
+type interceptDispatcher struct {
+	passDispatcher
+	once map[core.HookPoint]func()
+}
+
+func (d *interceptDispatcher) RunBefore(h *core.HookContext, point core.HookPoint, p behemoth.M) (behemoth.M, error) {
+	if f := d.once[point]; f != nil {
+		delete(d.once, point)
+		f()
+	}
+	return d.passDispatcher.RunBefore(h, point, p)
+}
+
+// fired counts the hook points the dispatcher ran for point.
+func (d *passDispatcher) fired(point core.HookPoint) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, h := range d.seen {
+		if h.Point == point {
+			n++
+		}
+	}
+	return n
+}
+
+// A revoke whose write loses to a concurrent update of its session reads the
+// session again and retries: the session ends revoked, and the handlers of
+// auth.session.afterRevoke hear of it once.
+func TestSessionRevokeRetriesAfterAConcurrentUpdate(t *testing.T) {
+	ctx := context.Background()
+	kv := &memoryKV{}
+	d := &interceptDispatcher{}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, UpdateAge: 2 * time.Hour}, d, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	d.once = map[core.HookPoint]func(){hooks.HookSessionBeforeRevoke: func() {
+		extended, err := sm.Touch(ctx, sess)
+		require.NoError(t, err)
+		require.NotNil(t, extended, "a Touch lands between the revoke's read and its write")
+	}}
+
+	require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"))
+	assert.Equal(t, map[string]models.SessionState{sess.ID: models.SessionRevoked}, sessionStates(t, sm, "u1"))
+	assert.Equal(t, models.SessionRevoked, kv.session(sess.LookupHash).State, "the cache holds the revoked copy")
+	_, err = sm.Get(ctx, raw)
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "%v", err)
+	assert.Equal(t, 1, d.fired(hooks.HookSessionAfterRevoke))
+
+	require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"), "a second revoke has nothing to do")
+	assert.Equal(t, 1, d.fired(hooks.HookSessionAfterRevoke), "and reports nothing")
+}
+
+// A promotion whose write loses to a concurrent update of its session reads
+// the session again and retries while it is still pending. Here the update
+// is a Touch from a handler of the revoke that makes room for the session.
+func TestSessionPromotionRetriesAfterAConcurrentUpdate(t *testing.T) {
+	ctx := context.Background()
+	d := &interceptDispatcher{}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), &memoryKV{}, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: 5 * time.Minute, UpdateAge: 2 * time.Hour,
+			MaxConcurrent: 1, EvictOldestOnLimit: true},
+		d, nil, managersAuth)
+	oldest, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	pending, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionPending})
+	require.NoError(t, err)
+	d.once = map[core.HookPoint]func(){hooks.HookSessionBeforeRevoke: func() {
+		extended, err := sm.Touch(ctx, pending)
+		require.NoError(t, err)
+		require.NotNil(t, extended, "a Touch lands between the promotion's read and its write")
+	}}
+
+	promoted, raw, err := sm.Promote(ctx, pending.ID, core.FactorTOTP)
+	require.NoError(t, err)
+	assert.Equal(t, models.SessionActive, promoted.State)
+	assert.EqualValues(t, 2, promoted.Version, "written after the Touch's version")
+	assert.Equal(t, map[string]models.SessionState{oldest.ID: models.SessionRevoked, pending.ID: models.SessionActive}, sessionStates(t, sm, "u1"))
+	_, err = sm.Validate(ctx, raw)
+	assert.NoError(t, err)
+}
+
+// interleavingRedis is interleavingKV over the Redis adapter.
+type interleavingRedis struct {
+	*redisAdapter.RedisAdapter
+	beforeSet func()
+}
+
+func (k *interleavingRedis) SetIfNewer(ctx context.Context, key, value string, version int64, ttl time.Duration) (bool, error) {
+	if f := k.beforeSet; f != nil {
+		k.beforeSet = nil
+		f()
+	}
+	return k.RedisAdapter.SetIfNewer(ctx, key, value, version, ttl)
+}
+
+// Over the Redis adapter, a revoke during a cache miss takes effect as it
+// does over the test's memory cache: the adapter's versioned values keep the
+// revoked copy. See ADR-0011.
+func TestSessionCacheOnRedis(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a Redis container")
+	}
+	ctx := context.Background()
+	client, cleanup := testutils.SetupRedisClient(t, ctx)
+	t.Cleanup(cleanup)
+	kv := &interleavingRedis{RedisAdapter: redisAdapter.NewRedisAdapter(client)}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour}, &passDispatcher{}, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	key := "session:" + sess.LookupHash
+	_, version, err := kv.GetVersioned(ctx, key)
+	require.NoError(t, err, "the new session is cached")
+	assert.Zero(t, version)
+
+	require.NoError(t, client.Del(ctx, key).Err()) // evicted, so the next Get misses
+	kv.beforeSet = func() { require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout")) }
+	_, err = sm.Get(ctx, raw)
+	require.NoError(t, err, "the Get that read the row before the revoke succeeds")
+	require.Nil(t, kv.beforeSet, "the revoke ran between the read and the cache write")
+
+	_, version, err = kv.GetVersioned(ctx, key)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, version, "the revoked copy stays")
+	_, err = sm.Get(ctx, raw)
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "%v", err)
+}
+
+// A key-value storage without core.VersionedCache can't order the cache's
+// writes. The manager then caches a session for UnversionedCacheTTL at
+// most, and ends an entry by deleting it. The race of ADR-0011 stays
+// possible there, bounded by that lifetime.
+func TestSessionCacheWithoutVersions(t *testing.T) {
+	ctx := context.Background()
+	mem := &memoryKV{}
+	sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), plainKV{mem}, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: 5 * time.Second}, &passDispatcher{}, nil, managersAuth)
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	require.NotNil(t, mem.session(sess.LookupHash))
+	assert.Equal(t, core.DefaultUnversionedCacheTTL, mem.ttl(sess.LookupHash), "the default lifetime")
+	_, _, err = mem.GetVersioned(ctx, "session:"+sess.LookupHash)
+	assert.Error(t, err, "written without a version")
+	_, err = sm.Validate(ctx, raw)
+	require.NoError(t, err)
+	require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"))
+	assert.Nil(t, mem.session(sess.LookupHash), "a revoke deletes the entry")
+
+	pending, pendingRaw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionPending})
+	require.NoError(t, err)
+	assert.LessOrEqual(t, mem.ttl(pending.LookupHash), 5*time.Second, "a session that ends sooner is cached until it ends")
+	_, _, err = sm.Promote(ctx, pending.ID, core.FactorTOTP)
+	require.NoError(t, err)
+	assert.Nil(t, mem.session(pending.LookupHash), "a promotion deletes the pending token's entry")
+	_, err = sm.Get(ctx, pendingRaw)
+	assert.True(t, errs.IsNotFound(err), "%v", err)
+
+	kv := &interleavingKV{memoryKV: &memoryKV{}}
+	capped := auth.NewSessionManager(store.New(sessionsTokensDB(t)), plainKV{kv}, testCrypto(t),
+		core.SessionConfig{ExpiresIn: time.Hour, UnversionedCacheTTL: 10 * time.Second}, &passDispatcher{}, nil, managersAuth)
+	sess, raw, err = capped.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	kv.clear()
+	kv.beforeSet = func() { require.NoError(t, capped.Revoke(ctx, sess.ID, "user_logout")) }
+	_, err = capped.Get(ctx, raw)
+	require.NoError(t, err)
+	require.Nil(t, kv.beforeSet)
+	stale := kv.session(sess.LookupHash)
+	require.NotNil(t, stale, "the copy read before the revoke went back in")
+	assert.Equal(t, models.SessionActive, stale.State)
+	assert.Equal(t, 10*time.Second, kv.ttl(sess.LookupHash), "for the lifetime the application chose")
 }
 
 // RequireSession refuses a request with a typed session error and writes no
@@ -690,7 +1060,7 @@ func TestSessionPromotionRenewsTheToken(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	assert.Equal(t, int32(1), wins.Load(), "the write is guarded on the pending state")
+	assert.Equal(t, int32(1), wins.Load(), "the write is guarded on the version, which pins the pending state")
 
 	waiting, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionPending})
 	require.NoError(t, err)

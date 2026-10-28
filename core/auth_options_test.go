@@ -12,6 +12,7 @@ func TestSessionConfigDefaults(t *testing.T) {
 	got := SessionConfig{}.WithDefaults()
 	want := SessionConfig{
 		ExpiresIn: 7 * 24 * time.Hour, PendingExpiresIn: 10 * time.Minute, FreshAge: 15 * time.Minute,
+		UnversionedCacheTTL: time.Minute,
 		// UpdateAge stays zero: rolling expiration is off unless asked for.
 	}
 	if got != want {
@@ -20,7 +21,7 @@ func TestSessionConfigDefaults(t *testing.T) {
 
 	set := SessionConfig{
 		ExpiresIn: time.Hour, PendingExpiresIn: time.Minute, UpdateAge: time.Second,
-		FreshAge: 2 * time.Minute, MaxConcurrent: 3, CaptureIPAndAgent: true,
+		FreshAge: 2 * time.Minute, MaxConcurrent: 3, CaptureIPAndAgent: true, UnversionedCacheTTL: 5 * time.Second,
 	}
 	if got := set.WithDefaults(); got != set {
 		t.Errorf("WithDefaults changed a config that was set: %+v", got)
@@ -40,6 +41,7 @@ func TestSessionConfigValidate(t *testing.T) {
 		"a negative pending lifetime": {SessionConfig{PendingExpiresIn: -time.Hour}, "PendingExpiresIn"},
 		"a negative update age":       {SessionConfig{UpdateAge: -time.Hour}, "UpdateAge"},
 		"a negative fresh age":        {SessionConfig{FreshAge: -time.Hour}, "FreshAge"},
+		"a negative cache lifetime":   {SessionConfig{UnversionedCacheTTL: -time.Hour}, "UnversionedCacheTTL"},
 	} {
 		err := tc.cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

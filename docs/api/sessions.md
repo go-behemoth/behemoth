@@ -27,6 +27,7 @@ ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
 | `MaxConcurrent` | 0, no limit | Sessions a user can use at once: active sessions that have not expired. A session that waits for a second factor doesn't count. |
 | `EvictOldestOnLimit` | false | At the limit, end the user's oldest active session to make room. A sign-in that waits for a second factor makes room once the second factor passes. When false, a sign-in at the limit is refused with `401` and the code `session_limit_reached`, before its second factor when it needs one. |
 | `CaptureIPAndAgent` | false | Record the client's IP address and user agent on the session. |
+| `UnversionedCacheTTL` | 1 minute | How long a session stays in the session cache when the key-value storage can't order the cache's writes. See [The session cache](#the-session-cache). |
 
 `BootConfig.Router.Carrier`, a `httpapi.TokenCarrierConfig`:
 
@@ -39,6 +40,19 @@ ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
 | `CookieInsecure` | false | Leaves `Secure` off the cookie, for development over plain HTTP. |
 
 A negative duration, a `Delivery` that is not one of the four values, and a cookie setting that can't work are configuration errors from `Boot`. See [Cookie attributes](#cookie-attributes) for the cookie settings `Boot` refuses.
+
+### The session cache
+
+With a key-value storage in `BootConfig.KV`, the session manager keeps a copy of each session there, and checks a request's token against the copy without a database query. Each change of the session goes to the copy too: an extension, a second factor, a revoke, and the deletion of the session's user.
+
+Two requests can write copies of one session at nearly the same time. One of them may be a request that read the session just before another request revoked it. Its copy is older, and must not replace the revoked one. Behemoth orders the copies by the session's `version` column, which every update of the session raises by one:
+
+- **A storage that implements `core.VersionedCache` keeps the latest copy.** It writes a copy only when the copy's version is later than the one it holds, whatever order the copies arrive in. A revoked session stays revoked in the cache, and a session stays in the cache for its whole life. The Redis adapter implements `core.VersionedCache`.
+- **A storage that implements only `behemoth.KeyValueStorage` keeps the last copy written.** The session manager then keeps each copy for `UnversionedCacheTTL` at most. A revoke that races a request's cache write can leave the session valid from the cache for that long.
+
+If you bring your own key-value storage, implement `core.VersionedCache` on it. `SetIfNewer` must compare the versions and write the value as one atomic step, as the Redis adapter does with a Lua script. A comparison followed by a separate write leaves the race open.
+
+The `version` column is new. Generate and apply a migration before you deploy a version of Behemoth that has it. The sessions that exist get version 0. On MongoDB, a session stored without the field reads as version 0 as well, and needs no migration.
 
 ## Token delivery
 

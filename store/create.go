@@ -61,13 +61,13 @@ func (s *Store) create(ctx context.Context, m behemoth.Model, prepare func(behem
 // changes to the row of m's table whose primary key is id, stamps updated_at
 // when stamp names that column, reads the row back into a fresh model and
 // runs AfterUpdate. prepare, if set, normalizes the final changes (after
-// hooks, so a hook's values are normalized too). guard adds conditions the
-// row must meet when it is written; a row that doesn't gets a NotFound
-// error, as a missing one does.
+// hooks, so a hook's values are normalized too). guard, if set, is a
+// condition the row must meet when it is written; a row that doesn't gets a
+// NotFound error, as a missing one does.
 //
 // Like create, the steps share one transaction: an error from either hook
 // leaves the row unchanged.
-func (s *Store) update(ctx context.Context, m behemoth.Model, id any, changes behemoth.M, stamp string, prepare func(behemoth.M), guard ...clause.Condition) (behemoth.Model, error) {
+func (s *Store) update(ctx context.Context, m behemoth.Model, id any, changes behemoth.M, stamp string, prepare func(behemoth.M), guard *clause.Expression) (behemoth.Model, error) {
 	const op = "Store.Update"
 	if err := s.checkUpdate(m, changes, op); err != nil {
 		return nil, err
@@ -92,8 +92,8 @@ func (s *Store) update(ctx context.Context, m behemoth.Model, id any, changes be
 		// A guard is checked in the write itself (UpdateOne re-checks its
 		// expression), so it holds however many calls race.
 		where := byKey
-		if len(guard) > 0 {
-			where = clause.Expression{Logic: clause.OpAnd, Conditions: append(append([]clause.Condition{}, byKey.Conditions...), guard...)}
+		if guard != nil {
+			where = clause.Expression{Logic: clause.OpAnd, Conditions: byKey.Conditions, Children: []*clause.Expression{guard}}
 		}
 		if err := tx.db.UpdateOne(ctx, m, where, changes); err != nil {
 			return tx.taken(op, m.SchemaName(), err)

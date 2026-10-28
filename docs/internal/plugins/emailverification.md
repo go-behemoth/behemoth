@@ -204,7 +204,7 @@ Step 3.2 comes after the read in 3.1 on purpose. An older revert revokes this to
 | --- | --- | --- |
 | `TokenManager.ListForSubject(kind, subject)` | `core/token.go`, `auth/token.go`, `Store.ListTokensForSubject` | the revert revoked some of a user's revert tokens and not all. It returns the usable tokens of a kind, oldest first; a key-value kind can't be listed. The revert now uses the store's listing below |
 | `Store.ListUnrevokedTokensForSubject(kind, subject)` | `store/tokens.go` | step 2 of the revert also revokes later tokens that were used, whose reverts may be running. The token manager lists usable tokens only, and its interface did not grow for one caller |
-| `Store.UpdateUserIfEmail(id, email, changes)` | `store/users.go` | the guarded writes of the confirm and the revert, in the shape of `UpdateSessionIn` |
+| `Store.UpdateUserIfEmail(id, email, changes)` | `store/users.go` | the guarded writes of the confirm and the revert, in the shape of the store's guarded session update (`UpdateSessionAt`) |
 | `reserved_values`, `Store.ReserveValue`, `CheckReservedValue`, `ReleaseReservedValue`, `FindReservedValue`, `PurgeExpiredReservedValues` | `models/reserved_value.go`, `store/reserved_values.go` | the old address's reservation. A core table, generic over the column ([`../models/models.md`](../models/models.md)) |
 | `SessionManager.IsFresh(session)` and `httpapi.RequireFreshSession` | `core/session.go`, `auth/session.go`, `httpapi/session.go` | `SessionConfig.FreshAge` and `Session.FreshAt` existed and nothing read them. A session is fresh when it is active and `FreshAt` is within `FreshAge` (`DefaultFreshAge`, 15 minutes, when zero). `FreshAt` is set by `Create` and `Promote` |
 | `MailMessage.Data`, two mail kinds | `core/mail.go` | the notice has to name the new address, which nothing else on the message carries |
@@ -278,7 +278,7 @@ The handlers are registered only with the change flow on, so an application that
 
 **Options considered:**
 
-- *Guard each write on the address that was read* (`UpdateUserIfEmail`, as `UpdateSessionIn` guards on the state), have a revert check its own link before each attempt, and revoke used later links. Works on every adapter through the `UpdateOne` convention that the store contract checks.
+- *Guard each write on the address that was read* (`UpdateUserIfEmail`, as `UpdateSessionAt` guards on the session's version), have a revert check its own link before each attempt, and revoke used later links. Works on every adapter through the `UpdateOne` convention that the store contract checks.
 - *A version column on `users`*, written and checked by every confirm and revert. Also covers a revert that has nothing to write, which the first option does not. A schema change to `users` for one plugin.
 - *A transaction per user that writes the user row first*, so that the two flows run one after the other. No schema change. Depends on each database's locking, which the contract tests do not cover.
 

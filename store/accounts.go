@@ -111,7 +111,7 @@ func (s *Store) UpdateAccount(ctx context.Context, id string, changes behemoth.M
 		}
 		changes[col] = sealed
 	}
-	updated, err := s.update(ctx, &models.Account{}, id, changes, models.AccountUpdatedAt, nil)
+	updated, err := s.update(ctx, &models.Account{}, id, changes, models.AccountUpdatedAt, nil, nil)
 	if err != nil {
 		return nil, err
 	}

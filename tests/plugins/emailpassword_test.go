@@ -52,7 +52,7 @@ CREATE TABLE sessions (
 	id TEXT PRIMARY KEY, user_id TEXT NOT NULL, lookup_hash TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL,
 	key_version INTEGER NOT NULL, state TEXT NOT NULL, expires_at TIMESTAMP NOT NULL, last_active_at TIMESTAMP,
 	fresh_at TIMESTAMP, factors TEXT, ip_address TEXT, user_agent TEXT, impersonator_id TEXT, revoked_at TIMESTAMP,
-	revoked_reason TEXT, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);
+	revoked_reason TEXT, version INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);
 CREATE TABLE audit_log (
 	id TEXT PRIMARY KEY, event_type TEXT NOT NULL, outcome TEXT NOT NULL, actor_type TEXT NOT NULL,
 	actor_id TEXT, delegate_type TEXT, delegate_id TEXT, subject_type TEXT, subject_id TEXT, session_id TEXT, request_id TEXT,

@@ -525,6 +525,42 @@ func TestStoreAuditLogMongo(t *testing.T) {
 	assert.Equal(t, 3, found.(*models.Session).KeyVersion)
 }
 
+// A session document stored before sessions had a version has no version
+// field. It reads as version 0, and an update from version 0 finds it, so
+// such a session can still be extended, promoted and revoked.
+func TestSessionWithoutAVersionOnMongo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a MongoDB container")
+	}
+	ctx := context.Background()
+	tables, resolver := coreSchema(t)
+	client, cleanup := testutils.SetupMongoTestDB(ctx, t)
+	t.Cleanup(cleanup)
+	db := mongoAdapter.NewMongoAdapter(client, "contract", resolver)
+	require.NoError(t, db.EnsureIndexes(ctx, tables))
+	st := store.New(db, store.WithSchema(resolver))
+	sm := auth.NewSessionManager(st, nil, testCrypto(t), core.SessionConfig{ExpiresIn: time.Hour}, &passDispatcher{}, nil, nil)
+
+	sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	sessions := client.Database("contract").Collection(resolver.Resolve(models.SessionTable))
+	versionField := resolver.ResolveColumn(models.SessionTable, models.SessionVersion)
+	_, err = sessions.UpdateOne(ctx, bson.M{resolver.ResolveColumn(models.SessionTable, models.SessionID): sess.ID},
+		bson.M{"$unset": bson.M{versionField: ""}})
+	require.NoError(t, err)
+
+	old, err := st.FindSessionByID(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.Zero(t, old.Version, "a missing version reads as 0")
+	require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"))
+	revoked, err := st.FindSessionByID(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.Equal(t, models.SessionRevoked, revoked.State)
+	assert.EqualValues(t, 1, revoked.Version)
+	_, err = sm.Get(ctx, raw)
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "%v", err)
+}
+
 func usersContract(t *testing.T, st *store.Store) {
 	ctx := context.Background()
 	u := &models.User{Email: " Ada@Example.com", Firstname: "Ada"}
@@ -594,10 +630,11 @@ func sessionsContract(t *testing.T, st *store.Store) {
 	require.NoError(t, err)
 	assert.Equal(t, models.SessionActive, promoted.State)
 	assert.Equal(t, []string{core.FactorPassword, core.FactorTOTP}, promoted.Factors, "the second factor is appended")
+	assert.EqualValues(t, 1, promoted.Version, "the update from version 0 wrote 1, and the version column round-trips")
 	_, err = sm.Get(ctx, raw)
 	assert.True(t, errs.IsNotFound(err), "the pending token stops working: %v", err)
-	_, err = st.UpdateSessionIn(ctx, sess.ID, models.SessionPending, behemoth.M{models.SessionRevokedReason: "unused"})
-	assert.True(t, errs.IsNotFound(err), "the state is checked in the write: %v", err)
+	_, err = st.UpdateSessionAt(ctx, sess.ID, sess.Version, behemoth.M{models.SessionRevokedReason: "unused"})
+	assert.True(t, errs.IsNotFound(err), "the version is checked in the write: %v", err)
 	require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"))
 	_, err = sm.Get(ctx, promotedRaw)
 	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "%v", err)
@@ -613,8 +650,7 @@ func sessionsContract(t *testing.T, st *store.Store) {
 		core.SessionConfig{ExpiresIn: time.Hour, MaxConcurrent: 1}, &passDispatcher{}, nil, nil)
 	expired, _, err := limited.Create(ctx, "u2", core.SessionMeta{State: models.SessionActive})
 	require.NoError(t, err)
-	_, err = st.UpdateSession(ctx, expired.ID, behemoth.M{models.SessionExpiresAt: st.Now().Add(-time.Hour)})
-	require.NoError(t, err)
+	setSessionExpiry(t, st, expired.ID, st.Now().Add(-time.Hour))
 	_, _, err = limited.Create(ctx, "u2", core.SessionMeta{State: models.SessionPending})
 	require.NoError(t, err)
 	_, _, err = limited.Create(ctx, "u2", core.SessionMeta{State: models.SessionActive})
@@ -633,8 +669,7 @@ func sessionsContract(t *testing.T, st *store.Store) {
 		if revoked {
 			require.NoError(t, sm.Revoke(ctx, sess.ID, "user_logout"))
 		}
-		_, err = st.UpdateSession(ctx, sess.ID, behemoth.M{models.SessionExpiresAt: expires})
-		require.NoError(t, err)
+		setSessionExpiry(t, st, sess.ID, expires)
 		return sess.ID
 	}
 	kept := func(id string) bool {
@@ -664,6 +699,17 @@ func sessionsContract(t *testing.T, st *store.Store) {
 	assert.True(t, kept(revoked), "a revoked session waits for its expiry")
 	assert.True(t, kept(live), "a live session is never purged")
 	require.NoError(t, st.PurgeExpiredSessions(ctx, now.Add(-time.Hour)), "a second pass finds nothing to delete")
+}
+
+// setSessionExpiry moves the expiry of the session with id, from the version
+// the session is at.
+func setSessionExpiry(t *testing.T, st *store.Store, id string, expires time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	sess, err := st.FindSessionByID(ctx, id)
+	require.NoError(t, err)
+	_, err = st.UpdateSessionAt(ctx, id, sess.Version, behemoth.M{models.SessionExpiresAt: expires})
+	require.NoError(t, err)
 }
 
 func tokensContract(t *testing.T, st *store.Store) {
@@ -802,8 +848,7 @@ func purgeContract(t *testing.T, st *store.Store, db behemoth.Database, resolver
 	sm := auth.NewSessionManager(st, nil, testCrypto(t), core.SessionConfig{ExpiresIn: time.Hour}, &passDispatcher{}, nil, nil)
 	sess, _, err := sm.Create(ctx, "u-purge-all", core.SessionMeta{State: models.SessionActive})
 	require.NoError(t, err)
-	_, err = st.UpdateSession(ctx, sess.ID, behemoth.M{models.SessionExpiresAt: twoHoursAgo})
-	require.NoError(t, err)
+	setSessionExpiry(t, st, sess.ID, twoHoursAgo)
 	tok := &models.Token{Kind: kindReset, Subject: "u-purge-all", LookupHash: "purge-all", TokenHash: "h", KeyVersion: 1, ExpiresAt: twoHoursAgo}
 	require.NoError(t, st.CreateToken(ctx, tok))
 	require.NoError(t, st.RecordAuditEvent(ctx, telemetry.AuditEvent{

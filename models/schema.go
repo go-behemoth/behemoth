@@ -52,6 +52,7 @@ func SessionTableSchema() schema.Table {
 			{Name: SessionImpersonatorID, Type: schema.ColTypeString, Length: 36, Nullable: true},
 			{Name: SessionRevokedAt, Type: schema.ColTypeTimestamp, Nullable: true},
 			{Name: SessionRevokedReason, Type: schema.ColTypeString, Length: 64, Nullable: true},
+			{Name: SessionVersion, Type: schema.ColTypeBigInt, Default: 0}, // rows that exist get 0. See ADR-0011.
 			{Name: SessionCreatedAt, Type: schema.ColTypeTimestamp},
 			{Name: SessionUpdatedAt, Type: schema.ColTypeTimestamp},
 		},
