@@ -13,6 +13,25 @@
 # modules too, but they are never tagged. A go.mod anywhere else stops the
 # script, so adding a module is a decision made here.
 #
+# Replace directives: a module that requires another published module
+# replaces it with its directory in this repository, without a version. The
+# replace is what makes a release one commit. A submodule tagged VERSION
+# requires the core module at VERSION, which doesn't exist until the tags are
+# pushed, and without the replace go mod tidy and go build fail on it, in a
+# go.work workspace too. It also lets one pull request change the core module
+# and an adapter together, with CI building the adapter against the core of
+# the same commit. Go ignores replace directives in a dependency's go.mod, so
+# users get the versions the modules require. One constraint follows: go
+# install PKG@VERSION refuses a module whose go.mod has replace directives, so
+# a command belongs in the root module, which has none.
+#
+# Keep the replaces while the published modules are released in lockstep from
+# this repository. A module that gets its own release cycle, or its own
+# repository, drops them: it requires a released core version, so that CI
+# tests what users get, and work across modules moves to a go.work file. A
+# change to the core and that module is then released in two steps, and this
+# script needs a version per module.
+#
 # A release takes two runs, because the release branch (dev while the major
 # version is 0, main after) takes changes through pull requests only:
 #
@@ -27,7 +46,8 @@
 #
 #   1. Checks the branch, a clean working tree, a branch that matches its
 #      upstream, tags that do not exist yet, and a CHANGELOG.md section for
-#      VERSION.
+#      VERSION. Then compares the API of every published module with the
+#      previous release (see "API changes" below).
 #   2. Sets the require line of every published module for another published
 #      module to VERSION.
 #   3. Runs go mod tidy in every module. A run that pushes stops here when
@@ -52,11 +72,25 @@
 # release is never pushed unchecked. --skip-proxy skips step 8. --yes skips
 # the question before the push.
 #
+# API changes: the previous release is the highest vX.Y.Z tag below VERSION.
+# Step 1 checks it out in a worktree and compares the exported API of each
+# published module there with the API in the working tree, using apidiff
+# (golang.org/x/exp/cmd/apidiff). Internal packages are left out. The script
+# follows the versioning policy in CHANGELOG.md: it stops when a patch release
+# changes the API, and from v1.0.0 on, when a minor release changes it
+# incompatibly. Other changes are listed, to be checked against CHANGELOG.md.
+# The check runs with --prepare too, so a wrong version is found before the
+# pull request.
+#
+# gorelease (golang.org/x/exp/cmd/gorelease) makes this comparison for one
+# module, but it loads the module the way a dependency is loaded, without its
+# replace directives. A submodule then needs the core module at VERSION from
+# the proxy, which has it only after the release. apidiff is the comparison
+# gorelease is built on, and both of its sides load here with the replaces.
+#
 # scripts/release_test.sh tests this script on a scratch repository. Run it
 # after a change here.
 #
-# Deferred: from the second release on, run gorelease (golang.org/x/exp/cmd/
-# gorelease) on each published module in step 4 to report breaking changes.
 # Deferred: print the advisory review checklist (docs/internal/security) before
 # step 7 once the threat catalogue exists.
 
@@ -108,6 +142,8 @@ done
 [[ $VERSION =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] \
   || die "$VERSION is not a version like v0.2.0 or v0.2.0-rc.1"
 MAJOR=${BASH_REMATCH[1]}
+MINOR=${BASH_REMATCH[2]}
+CORE=v$MAJOR.$MINOR.${BASH_REMATCH[3]} # VERSION without a pre-release suffix
 
 # A --prepare run pushes nothing, and CI tests its pull request.
 if [ "$PREPARE" -eq 1 ]; then
@@ -171,6 +207,43 @@ for d in "${PUBLISHED[@]}"; do
   [ "$got" = "$want" ] || die "$d/go.mod declares module $got, but its tag only works for $want"
 done
 
+# --- cleanup -----------------------------------------------------------------
+
+# TMP holds the worktree of the previous release and other scratch files.
+TMP=$(mktemp -d)
+
+# If the script stops after it has edited files and before the commit, put the
+# tree back as it was: it was clean when the script started. EDITING is set
+# when the edits start.
+COMMITTED=0
+cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$COMMITTED" -eq 0 ] && [ -n "${EDITING:-}" ]; then
+    echo "release: failed; restoring the working tree" >&2
+    git checkout -- . || true
+  fi
+  git worktree remove --force "$TMP/base" 2>/dev/null || true
+  rm -rf "$TMP"
+  exit "$status"
+}
+trap cleanup EXIT
+
+# api_changes reads a report of apidiff and prints one line per change, as
+# "incompatible: CHANGE" or "compatible: CHANGE". A change names its package
+# as "package PATH" or as a path relative to the module, such as
+# "./utils.Name". Changes in internal packages are left out: no other module
+# can import them.
+api_changes() {
+  awk '
+    /^Incompatible changes:$/ { kind = "incompatible"; next }
+    /^Compatible changes:$/   { kind = "compatible"; next }
+    /^- / {
+      what = ($2 == "package") ? $3 : $2
+      if (what ~ /(^|\/)internal([\/.:]|$)/) next
+      print kind ": " substr($0, 3)
+    }'
+}
+
 # --- step 1: checks ----------------------------------------------------------
 
 step "Check the repository"
@@ -212,7 +285,8 @@ grep -Eq "^## \[${VERSION#v}\]" CHANGELOG.md \
 
 # The require lines of a published module are bumped to VERSION, so a replace
 # directive that names only v0.0.0 would stop applying. Every replace of a
-# published module must therefore be unversioned.
+# published module must therefore be unversioned. See "Replace directives" at
+# the top for why the replaces exist.
 for d in "${ALL[@]}"; do
   for p in "${PUBLISHED[@]}"; do
     path=$(published_path "$p")
@@ -222,18 +296,61 @@ for d in "${ALL[@]}"; do
   done
 done
 
-# From here on the script edits files. If it stops before the commit, put the
-# tree back as it was: it was clean when the script started.
-COMMITTED=0
-cleanup() {
-  status=$?
-  if [ "$status" -ne 0 ] && [ "$COMMITTED" -eq 0 ] && [ -n "${EDITING:-}" ]; then
-    echo "release: failed; restoring the working tree" >&2
-    git checkout -- . || true
+# Release candidates are left out of the previous release: a release is
+# compared with the release before it, whatever candidates came between.
+PREV=$({ git tag -l 'v*'; echo "$CORE"; } \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV \
+  | grep -x -B1 -- "$CORE" | grep -vx -- "$CORE" || true)
+
+if [ -z "$PREV" ]; then
+  API_SUMMARY="first release, no API to compare with"
+  echo "No release before $VERSION: no API to compare with."
+else
+  step "Compare the API with $PREV"
+  command -v apidiff >/dev/null \
+    || die "apidiff is not installed: go install golang.org/x/exp/cmd/apidiff@latest"
+  git worktree add --quiet --detach "$TMP/base" "$PREV"
+
+  API_CHANGES=0
+  API_BREAKS=0
+  for d in "${PUBLISHED[@]}"; do
+    path=$(published_path "$d")
+    if [ ! -f "$TMP/base/$d/go.mod" ] || [ "$(mod_path "$TMP/base/$d")" != "$path" ]; then
+      echo "$d: not in $PREV as $path, nothing to compare"
+      continue
+    fi
+    (cd "$TMP/base/$d" && apidiff -m -w "$TMP/old.export" "$path")
+    (cd "$d" && apidiff -m -w "$TMP/new.export" "$path")
+    changes=$(apidiff -m "$TMP/old.export" "$TMP/new.export" | api_changes)
+    if [ -z "$changes" ]; then
+      echo "$d: no change"
+      continue
+    fi
+    echo "$d:"
+    echo "$changes" | sed 's/^/  /'
+    API_CHANGES=$((API_CHANGES + $(echo "$changes" | wc -l)))
+    API_BREAKS=$((API_BREAKS + $(echo "$changes" | grep -c '^incompatible: ' || true)))
+  done
+  git worktree remove --force "$TMP/base"
+
+  # The versioning policy in CHANGELOG.md. From v1.0.0 on, an incompatible
+  # change needs a new major version, which needs a new module path: that is
+  # more than a version number, so the script stops.
+  IFS=. read -r prev_major prev_minor _ <<< "${PREV#v}"
+  if [ "$API_CHANGES" -gt 0 ] && [ "$MAJOR" = "$prev_major" ] && [ "$MINOR" = "$prev_minor" ]; then
+    die "$VERSION is a patch release of $PREV, but the API changed (above). CHANGELOG.md allows API changes in a minor release only: release v$prev_major.$((prev_minor + 1)).0 instead"
   fi
-  exit "$status"
-}
-trap cleanup EXIT
+  if [ "$API_BREAKS" -gt 0 ] && [ "$MAJOR" = "$prev_major" ] && [ "$MAJOR" -ge 1 ]; then
+    die "$API_BREAKS incompatible API change(s) since $PREV (above): from v1.0.0 on, they need a new major version and module path"
+  fi
+  if [ "$API_CHANGES" -eq 0 ]; then
+    API_SUMMARY="no API change since $PREV"
+  else
+    API_SUMMARY="$API_CHANGES API change(s) since $PREV, $API_BREAKS of them incompatible"
+    echo
+    echo "Check that CHANGELOG.md lists these changes, the incompatible ones under Changed or Removed."
+  fi
+fi
 
 # --- step 2: set the requires ------------------------------------------------
 
@@ -330,6 +447,7 @@ fi
 if [ "$ASSUME_YES" -eq 0 ]; then
   echo
   echo "About to push ${#TAGS[@]} tags on $(git rev-parse --short HEAD), the head of origin/$BRANCH."
+  echo "API: $API_SUMMARY."
   echo "The Go proxy keeps a tag for good: a pushed tag cannot be taken back."
   read -r -p "Push? [y/N] " answer
   [ "$answer" = y ] || [ "$answer" = Y ] || die "not pushed; the tags stay local"
@@ -357,8 +475,8 @@ if [ "$PROXY_CHECK" -eq 0 ]; then
 fi
 
 step "Fetch the tagged modules through $PROXY"
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+# go list runs outside any module, so the repository's go.mod files play no part.
+mkdir "$TMP/proxy"
 
 # The proxy fetches a new tag from the repository on the first request, which
 # can fail for a moment after the push. Retry before giving up.
@@ -366,7 +484,7 @@ for d in "${PUBLISHED[@]}"; do
   path=$(published_path "$d")
   ok=0
   for attempt in 1 2 3 4 5 6; do
-    if (cd "$scratch" && GOPROXY=$PROXY GOFLAGS= GOPRIVATE= GONOPROXY= \
+    if (cd "$TMP/proxy" && GOPROXY=$PROXY GOFLAGS= GOPRIVATE= GONOPROXY= \
           go list -m "$path@$VERSION" >/dev/null 2>&1); then
       ok=1
       break
