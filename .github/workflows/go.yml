@@ -125,11 +125,7 @@ jobs:
 
   test-integration:
     name: Integration ${{ matrix.group }} (${{ matrix.releases }} releases)
-    # MongoDB 8 refuses to start on Linux 6.19 and later
-    # (https://jira.mongodb.org/browse/SERVER-121912), and ubuntu-latest moves
-    # to a newer kernel with the next Ubuntu release. Move to ubuntu-latest
-    # once the mongo image below starts there.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -148,6 +144,12 @@ jobs:
         # docs/api/supported-databases.md lists the releases. Move an image
         # below when its database has a new major release, and the Go
         # releases with those of test-modules.
+        #
+        # SQL Server 2025 and MongoDB 8 don't run on GitHub's runners: SQL
+        # Server 2025 crashes at startup there, and MongoDB 8 refuses Linux
+        # 6.19 to 7.0.13, which includes the runners' Ubuntu 7.0 kernel. The
+        # newest releases of the two that run are tested instead. See
+        # docs/internal/testing/testing.md.
         releases: [ oldest, newest ]
         include:
           - releases: oldest
@@ -157,8 +159,8 @@ jobs:
             coverage: true
             postgres: postgres:18
             mysql: mysql:9
-            sqlserver: mcr.microsoft.com/mssql/server:2025-latest
-            mongo: mongo:8
+            sqlserver: mcr.microsoft.com/mssql/server:2022-latest
+            mongo: mongo:7.0
             redis: redis:8-alpine
     env:
       # Empty for the oldest releases: tests/testutils then starts its own.

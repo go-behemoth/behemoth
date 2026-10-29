@@ -50,4 +50,4 @@ BEHEMOTH_TEST_REDIS_IMAGE=redis:8-alpine \
   go test ./storage/... ./store/...
 ```
 
-Each variable takes a container image name and tag. A variable you leave out keeps the minimum release. MongoDB 8 does not start on Linux 6.19 and later ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)).
+Each variable takes a container image name and tag. A variable you leave out keeps the minimum release. MongoDB 8 does not start on Linux 6.19 to 7.0.13, which includes the 7.0 kernels of Ubuntu ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)).

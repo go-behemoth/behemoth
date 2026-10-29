@@ -41,13 +41,18 @@ The container suites start the oldest release of each database that Behemoth sup
 
 ### Two pairings of releases
 
-`tests/` runs twice. `oldest` pairs the oldest supported Go release with the oldest supported release of each database, the images `tests/testutils` starts by default. `newest` pairs the newest Go release with the newest release of each database, which the matrix names in `BEHEMOTH_TEST_*_IMAGE`: `postgres:18`, `mysql:9`, `mcr.microsoft.com/mssql/server:2025-latest`, `mongo:8`, and `redis:8-alpine`.
+`tests/` runs twice. `oldest` pairs the oldest supported Go release with the oldest supported release of each database, the images `tests/testutils` starts by default. `newest` pairs the newest Go release with the newest release of each database that runs on GitHub's runners, which the matrix names in `BEHEMOTH_TEST_*_IMAGE`: `postgres:18`, `mysql:9`, `mcr.microsoft.com/mssql/server:2022-latest`, `mongo:7.0`, and `redis:8-alpine`.
 
 Each supported release runs once, in two runs where four would test each Go release with each database release. The Go release and the database release change different code, the Go side and the server side of a connection, so a failure that only one combination shows is unlikely. If one turns up, add the combination to the matrix.
 
 A tag such as `postgres:18` follows the patch releases of its major release. Move it when the database has a new major release, and the minimum when the maker ends support for the oldest one. Update `supported-databases.md` in the same change.
 
-The integration job runs on `ubuntu-24.04` rather than `ubuntu-latest`: MongoDB 8 refuses to start on Linux 6.19 and later ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)), and `ubuntu-latest` moves to a newer kernel with the next Ubuntu release. MongoDB 8 and SQL Server 2025 don't start on the development machine either, so CI is the only place they run (`docs/ongoing.md`, M31).
+The newest releases of SQL Server and MongoDB, 2025 and 8, don't run on GitHub's runners (seen 2026-10-29, image `ubuntu24/20261026`, kernel `7.0.0-1017-azure`), so `newest` takes the release before each (`docs/ongoing.md`, M31):
+
+- **MongoDB 8** refuses to start on Linux 6.19 to 7.0.13 ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)). Earlier builds that started there crashed within about a minute. Ubuntu numbers every kernel of the 7.0 series `7.0.0-N`, so MongoDB refuses all of them, the runners' included. MongoDB 7.0 runs on every kernel.
+- **SQL Server 2025** stops at startup on the runners with a fatal error in its platform layer (`Reason: 0x00000002`, `Last errno: 11`). SQL Server 2019 starts there. On the development machine, 2025 starts when the container is limited to four logical CPUs of two cores (`--cpuset-cpus=0-3`). Without the limit it stops with an assertion on the hybrid CPU's topology. The cause on the runners is not known.
+
+Put each back into `newest` once it starts on `ubuntu-latest`.
 
 ---
 
