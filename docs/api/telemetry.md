@@ -159,9 +159,10 @@ Router: httpapi.RouterConfig{RequestIDHeader: "X-Correlation-ID"},
 Read the ID in a route handler or a hook handler:
 
 ```go
-id := telemetry.RequestIDFrom(rctx.Ctx) // in a route handler
-id := telemetry.RequestIDFrom(hctx.Ctx) // in a hook handler; "" outside a request
+id := telemetry.RequestIDFrom(rctx.Ctx) // in a route handler; use hctx.Ctx in a hook handler
 ```
+
+Outside a request, the ID is the empty string.
 
 ## Log from a plugin
 
@@ -178,7 +179,7 @@ func (p *Plugin) accept(rctx *httpapi.RequestContext) error {
 		p.log.Warn(rctx.Ctx, "invite could not be redeemed", telemetry.ErrorFields(err))
 		return err
 	}
-	...
+	return nil
 }
 ```
 

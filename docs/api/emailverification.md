@@ -175,8 +175,14 @@ This is what stops someone who got hold of a long-lived session, for example fro
 You can put a fresh-session check on a route of your own ([Sessions](sessions.md#fresh-sessions) has more):
 
 ```go
-{Method: http.MethodPost, Path: "/account/delete", Handler: deleteAccount,
-	Middlewares: []httpapi.Middleware{httpapi.RequireFreshSession(ac.SessionManager)}},
+func (p *Plugin) Routes() []httpapi.Route {
+	return []httpapi.Route{{
+		Method:      http.MethodPost,
+		Path:        "/account/delete",
+		Handler:     deleteAccount,
+		Middlewares: []httpapi.Middleware{httpapi.RequireFreshSession(p.ac.SessionManager)},
+	}}
+}
 ```
 
 It does what `httpapi.RequireSession` does first, so use it alone.

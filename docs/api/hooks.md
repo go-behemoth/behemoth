@@ -577,6 +577,19 @@ ac, err := engine.Boot(ctx, app, db, engine.BootConfig{
 
 Behemoth's own rules are `engine.RuleSignInAddress` and `engine.RuleSignUpAddress`, 10 attempts a minute per client address and method, and `engine.RuleSessionTokenAddress`, 30 a minute per client address. Each plugin's page lists its rules.
 
+### Choose what happens when counting fails
+
+A rule counts attempts in the key-value storage of `BootConfig.KV` when it can count atomically, as the Redis adapter does, and otherwise in the `rate_limits` table. When that storage can't count an attempt, `RateLimitConfig.FailureMode` decides what happens to the request:
+
+- **`core.FailOpen`** is the default. Behemoth logs a warning, counts the check as `result="error"` in `behemoth.ratelimit.checks`, and lets the request proceed. An outage of the storage turns every rate limit off while it lasts.
+- **`core.FailClosed`** refuses the request with the same `rate_limited` error as an attempt over the limit, but with no `Retry-After` time. An outage of the storage then refuses every request that a rule covers.
+
+```go
+RateLimit: core.RateLimitConfig{FailureMode: core.FailClosed},
+```
+
+Choose `core.FailClosed` where an unprotected sign-in is worse than a refused one.
+
 ## Audit
 
 A point can be declared with an `AuditSpec`. The dispatcher then records one audit event each time the point is dispatched, after its handlers have run. The event type defaults to the point's name. Recording differs by kind of point:

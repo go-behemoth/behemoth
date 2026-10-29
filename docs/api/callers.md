@@ -106,10 +106,13 @@ Each flow that requires a caller requires a permission. A signed-in user holds e
 | `oauth_account:read` | self | `oauth.Plugin.Accounts` |
 | `oauth_account:manage` | self, with a fresh session to start a link and to unlink | `oauth.Plugin.BeginLink`, `oauth.Plugin.Unlink`, and `oauth.Plugin.Complete` for a link |
 | `oauth_token:read` | self | `oauth.Plugin.AccessToken` |
+| `two_factor:read` | self | `twofactor.Plugin.Status` |
+| `two_factor:manage` | self, with a fresh session | `twofactor.Plugin.Enroll`, `Confirm`, `Disable`, and `RegenerateRecoveryCodes` |
 | `user:set_password` | admin | `emailpassword.Plugin.SetPassword` |
 | `user:set_username` | admin | `username.Plugin.SetUsername` |
 | `user:set_phone` | admin | `phonenumber.Plugin.SetPhoneNumber` |
 | `user:add_phone` | admin | `phonenumber.Plugin.AddNumber` |
+| `user:reset_two_factor` | admin | `twofactor.Plugin.Reset` |
 
 Each package exports its permissions as constants, such as `emailpassword.PermissionSignOut` and `core.PermissionSessionTokenIssue`.
 

@@ -190,9 +190,15 @@ auth := engine.Group("", logRequests)
 A plugin writes a path parameter as `{name}` and reads it with `rctx.Param("name")`, whatever the router:
 
 ```go
-httpapi.Route{Method: http.MethodGet, Path: "/users/{id}", Handler: func(rctx *httpapi.RequestContext) error {
-	return rctx.Response.JSON(http.StatusOK, map[string]string{"id": rctx.Param("id")})
-}}
+func (p *Plugin) Routes() []httpapi.Route {
+	return []httpapi.Route{{
+		Method: http.MethodGet,
+		Path:   "/users/{id}",
+		Handler: func(rctx *httpapi.RequestContext) error {
+			return rctx.Response.JSON(http.StatusOK, map[string]string{"id": rctx.Param("id")})
+		},
+	}}
+}
 ```
 
 Each adapter translates the syntax for its router.

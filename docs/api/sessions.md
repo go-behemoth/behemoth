@@ -282,12 +282,25 @@ Refusals are counted in the `behemoth.http.origin_refused` metric by `reason`. S
 
 ## Protect your own routes
 
+The router runs the routes that plugins declare, and mounts them under `RouterConfig.BasePath` and the plugin's `PluginMeta.MountPath`. To protect a route of your own, declare it in a plugin of your own, and put `httpapi.RequireSession` in front of its handler:
+
 ```go
-{Method: http.MethodGet, Path: "/me", Handler: me,
-	Middlewares: []httpapi.Middleware{httpapi.RequireSession()}},
+func (p *Plugin) Routes() []httpapi.Route {
+	return []httpapi.Route{{
+		Method:      http.MethodGet,
+		Path:        "/me",
+		Handler:     me,
+		Middlewares: []httpapi.Middleware{httpapi.RequireSession()},
+	}}
+}
+
+func me(rctx *httpapi.RequestContext) error {
+	session, _ := identity.CallerFrom(rctx.Ctx).Session()
+	return rctx.Response.JSON(http.StatusOK, map[string]string{"user_id": session.UserID})
+}
 ```
 
-The router authenticates every request before its route runs: it reads the token where the delivery says, and puts the caller on the request's context. `httpapi.RequireSession` answers `401` unless the caller signed in with a valid active session. Your handler reads the session from the caller with `identity.CallerFrom(rctx.Ctx).Session()`, and the user is `Session().UserID`. [Callers and permissions](callers.md) describes the caller in full. With `UpdateAge` set, a session that is due has been extended by then, and the session your handler reads has the new expiry. See [Rolling expiration](#rolling-expiration).
+The router authenticates every request before its route runs: it reads the token where the delivery says, and puts the caller on the request's context. `httpapi.RequireSession` answers `401` unless the caller signed in with a valid active session. Your handler reads the session from the caller with `identity.CallerFrom(rctx.Ctx).Session()`, and the user is `session.UserID`. [Callers and permissions](callers.md) describes the caller in full. With `UpdateAge` set, a session that is due has been extended by then, and the session your handler reads has the new expiry. See [Rolling expiration](#rolling-expiration).
 
 A request it refuses does not reach your handler. The response is JSON with a message and a code your client can act on:
 
@@ -312,7 +325,14 @@ A `401` always means the client has no usable session. If Behemoth could not che
 A session is fresh for `FreshAge` after its sign-in, or after its second factor. `httpapi.RequireFreshSession` is `RequireSession` plus that check, for a route that changes something sensitive: the account's email, a password, a deletion. A session that is valid and too old gets `401` with the code `session_not_fresh`, and the client asks the user to sign in again.
 
 ```go
-Middlewares: []httpapi.Middleware{httpapi.RequireFreshSession(ac.SessionManager)},
+func (p *Plugin) Routes() []httpapi.Route {
+	return []httpapi.Route{{
+		Method:      http.MethodPost,
+		Path:        "/account/delete",
+		Handler:     deleteAccount,
+		Middlewares: []httpapi.Middleware{httpapi.RequireFreshSession(p.ac.SessionManager)},
+	}}
+}
 ```
 
 Nothing refreshes a session in place. Signing in again is how a user gets a fresh one.
