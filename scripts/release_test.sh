@@ -12,12 +12,14 @@
 # repository on disk whose hook logs the refs of every push, so the test sees
 # exactly what a release pushes. The modules depend on a module that the test
 # serves from a proxy directory, so that they have go.sum files as Behemoth's
-# do, and nothing is fetched from the network. A stub stands in for
-# govulncheck.
+# do, and nothing is fetched from the network. Stubs stand in for govulncheck
+# and apidiff. The apidiff stub prints the report a scenario sets in
+# APIDIFF_REPORT, and logs the directory each side of a comparison loads in.
 #
 # The test walks through a release: the refusals before the version change is
 # merged, the --prepare run on a branch, a rebase merge of its pull request,
-# the release run on dev, and a --no-push trial.
+# and the release run on dev. Then it checks the API comparison of later
+# releases against the versioning policy, with --no-push and --prepare runs.
 #
 # It needs go and git on PATH. It works in a temporary directory, which it
 # removes at the end unless the test failed or --keep is given.
@@ -70,6 +72,21 @@ git config --global advice.detachedHead false
 printf '#!/bin/sh\necho "No vulnerabilities found."\n' > "$T/bin/govulncheck"
 chmod +x "$T/bin/govulncheck"
 
+# apidiff -m -w FILE PATH logs its directory and PATH, and apidiff -m OLD NEW
+# prints APIDIFF_REPORT.
+cat > "$T/bin/apidiff" <<EOF
+#!/bin/sh
+if [ "\$2" = -w ]; then
+  echo "\$(pwd) \$4" >> "$T/apidiff.log"
+  echo "\$4" > "\$3"
+  exit 0
+fi
+printf '%s' "\$APIDIFF_REPORT"
+EOF
+chmod +x "$T/bin/apidiff"
+export APIDIFF_REPORT=""
+: > "$T/apidiff.log"
+
 # check DESCRIPTION CONDITION reports whether the shell condition holds.
 check() {
   if eval "$2"; then
@@ -82,11 +99,13 @@ check() {
 }
 
 # run NAME ARG... runs the script in the scratch repository with ARGs, and
-# keeps its output in NAME.log and its exit code in NAME.code.
+# keeps its output in NAME.log and its exit code in NAME.code. Its input is
+# the file INPUT names, or nothing, so that a question nobody expects fails
+# rather than waits.
 run() {
   local name=$1 status=0
   shift
-  (cd "$W" && scripts/release.sh "$@") > "$T/$name.log" 2>&1 || status=$?
+  (cd "$W" && scripts/release.sh "$@") < "${INPUT:-/dev/null}" > "$T/$name.log" 2>&1 || status=$?
   echo "$status" > "$T/$name.code"
 }
 
@@ -198,6 +217,7 @@ check "exits 0" '[ "$(code prep)" = 0 ]'
 check "commits the version change on the branch" '[ "$(git -C "$W" log -1 --format=%s)" = "chore(release): v0.2.0" ] && [ "$(git -C "$W" rev-parse HEAD~1)" = "$base" ]'
 check "sets every published submodule to v0.2.0" '[ "$(git -C "$W" grep -l "example.com/rel v0.2.0" -- "*/go.mod" | grep -vc "^tests/")" = ${#SUBMODULES[@]} ]'
 check "skips the tests and govulncheck" '! says prep "Run the tests" && ! says prep "govulncheck"'
+check "has no earlier release to compare the API with" 'says prep "No release before v0.2.0" && [ ! -s "$T/apidiff.log" ]'
 check "makes no tag" '[ -z "$(git -C "$W" tag -l)" ]'
 check "leaves a clean tree" '[ -z "$(git -C "$W" status --porcelain)" ]'
 check "says what to do next" 'says prep "open a pull request into dev"'
@@ -221,8 +241,10 @@ git -C "$W" pull -q --ff-only origin dev
 
 echo "== the release run on dev"
 head=$(git -C "$W" rev-parse HEAD)
-run release v0.2.0 --yes --skip-proxy
+echo y > "$T/yes"
+INPUT=$T/yes run release v0.2.0 --skip-proxy
 check "exits 0" '[ "$(code release)" = 0 ]'
+check "asks before the push, with what the API comparison found" 'says release "About to push" && says release "API: first release, no API to compare with."'
 check "runs govulncheck and the tests" 'says release "Run govulncheck" && says release "Run the tests of every module"'
 check "makes no commit" '[ "$(git -C "$W" rev-parse HEAD)" = "$head" ] && says release "nothing to commit"'
 check "tags HEAD for every published module" '[ "$(git -C "$W" tag --points-at HEAD | wc -l)" = $((${#SUBMODULES[@]} + 1)) ]'
@@ -239,15 +261,62 @@ echo "== --skip-tests on a run that pushes"
 run skip v0.3.0 --skip-tests
 check "is refused" '[ "$(code skip)" = 1 ] && says skip "--skip-tests needs --no-push"'
 
-echo "== a --no-push trial on dev"
+# --- API changes -------------------------------------------------------------
+
+MODULES=$((${#SUBMODULES[@]} + 1))
+sed -i 's/^## Unreleased$/## Unreleased\n\n## [0.2.1] - 2026-10-29/' "$W/CHANGELOG.md"
+git -C "$W" commit -qam "docs(changelog): v0.2.1"
+
+echo "== a patch release that changes the API"
+export APIDIFF_REPORT=$'Compatible changes:\n- ./utils.Added: added\n'
+head=$(git -C "$W" rev-parse HEAD)
+run patch v0.2.1 --no-push --skip-tests --skip-vulncheck
+check "exits 1" '[ "$(code patch)" = 1 ]'
+check "compares with v0.2.0" 'says patch "Compare the API with v0.2.0"'
+check "lists the change" 'says patch "compatible: ./utils.Added: added"'
+check "asks for a minor release" 'says patch "is a patch release of v0.2.0, but the API changed" && says patch "release v0.3.0 instead"'
+check "loads the old API in a worktree of v0.2.0, the new one in the repository" '[ "$(grep -c "/base" "$T/apidiff.log")" = $MODULES ] && [ "$(grep -c "^$W" "$T/apidiff.log")" = $MODULES ]'
+check "removes the worktree" '[ "$(git -C "$W" worktree list | wc -l)" = 1 ]'
+check "makes no commit and no tag" '[ "$(git -C "$W" rev-parse HEAD)" = "$head" ] && [ -z "$(git -C "$W" tag -l "*v0.2.1")" ]'
+
+echo "== a patch release whose changes are all in internal packages"
+export APIDIFF_REPORT=$'Incompatible changes:\n- package example.com/rel/internal/x: removed\nCompatible changes:\n- ./internal/y.Added: added\n'
+run patch-internal v0.2.1 --no-push --skip-tests --skip-vulncheck
+check "exits 0" '[ "$(code patch-internal)" = 0 ]'
+check "finds no change in any module" '[ "$(grep -c ": no change$" "$T/patch-internal.log")" = $MODULES ]'
+check "tags every published module" '[ "$(git -C "$W" tag -l "*v0.2.1" | wc -l)" = $MODULES ]'
+
+echo "== a minor release before v1.0.0 with an incompatible change"
 sed -i 's/^## Unreleased$/## Unreleased\n\n## [0.3.0] - 2026-10-29/' "$W/CHANGELOG.md"
 git -C "$W" commit -qam "docs(changelog): v0.3.0"
+export APIDIFF_REPORT=$'Incompatible changes:\n- Name: removed\n'
 : > "$T/pushes.log"
 run trial v0.3.0 --no-push --skip-tests --skip-vulncheck
 check "exits 0" '[ "$(code trial)" = 0 ]'
+check "compares with v0.2.1" 'says trial "Compare the API with v0.2.1"'
+check "lists the change" 'says trial "incompatible: Name: removed"'
+check "asks to check the changelog" 'says trial "Check that CHANGELOG.md lists these changes"'
 check "commits the version change" '[ "$(git -C "$W" log -1 --format=%s)" = "chore(release): v0.3.0" ]'
-check "tags every published module" '[ "$(git -C "$W" tag -l "*v0.3.0" | wc -l)" = $((${#SUBMODULES[@]} + 1)) ]'
+check "tags every published module" '[ "$(git -C "$W" tag -l "*v0.3.0" | wc -l)" = $MODULES ]'
 check "pushes nothing" '[ "$(pushes)" = 0 ]'
+
+echo "== a minor release after v1.0.0 with an incompatible change"
+git -C "$W" tag v1.0.0
+git -C "$W" switch -q -c release-v1.1.0
+sed -i 's/^## Unreleased$/## Unreleased\n\n## [1.1.0] - 2026-10-30/' "$W/CHANGELOG.md"
+git -C "$W" commit -qam "docs(changelog): v1.1.0"
+head=$(git -C "$W" rev-parse HEAD)
+run v1-break v1.1.0 --prepare
+check "exits 1" '[ "$(code v1-break)" = 1 ]'
+check "compares with v1.0.0 in a --prepare run" 'says v1-break "Compare the API with v1.0.0"'
+check "asks for a new major version" 'says v1-break "they need a new major version and module path"'
+check "makes no commit" '[ "$(git -C "$W" rev-parse HEAD)" = "$head" ]'
+
+echo "== a minor release after v1.0.0 with a compatible change"
+export APIDIFF_REPORT=$'Compatible changes:\n- Added: added\n'
+run v1-add v1.1.0 --prepare
+check "exits 0" '[ "$(code v1-add)" = 0 ]'
+check "commits the version change" '[ "$(git -C "$W" log -1 --format=%s)" = "chore(release): v1.1.0" ]'
 
 echo
 echo "passed $PASS, failed $FAIL"
