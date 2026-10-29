@@ -29,7 +29,7 @@ RFC 7517, section 5, advises ignoring a key that can't be used, and keeping the 
 | --- | --- | --- |
 | `RSA` | the modulus has at least 2048 bits, and the exponent is odd, at least 3, and at most 2^31-1 | empty: an RSA key can sign with RS256, RS384, RS512, PS256, PS384, and PS512 |
 | `EC` | the curve is P-256, P-384, or P-521, and the point is on it (`ecdsa.ParseUncompressedPublicKey`) | ES256, ES384, or ES512, by the curve |
-| `OKP` | the curve is Ed25519, and `x` has 32 bytes | EdDSA |
+| `OKP` | the curve is Ed25519, and `x` has 32 bytes. The point's order is not checked (`docs/ongoing.md`, M37). | EdDSA |
 
 Every key is also left out when:
 
@@ -95,6 +95,21 @@ The checks run in this order, and the first that fails decides the code:
 `fits` is the ADR's rule for the algorithm: a key that names one signs with it alone, and every key signs only with an algorithm of its type (`algorithmsOf`). The second half also catches a `KeySet` that pairs a key with an algorithm of another type.
 
 `externalJWT.verify` calls `VerifyJWT` with the configured issuer and the external audiences, no leeway, and `iat` unchecked, as before the move. It decodes `wireClaims` from `VerifiedJWT.Claims` and builds `crypto.Claims` with `claimsOf`. Internal tokens keep their own path: they are HS256, and `VerifyJWT` refuses every symmetric algorithm. They share `parse` and `checkClaims`.
+
+## Published test vectors
+
+| Test | File | Covers |
+| --- | --- | --- |
+| `TestJOSEExampleKeys` | `crypto/jose_vectors_test.go` | the JWKs of RFC 7515 (appendix A), RFC 7517 (appendices A and B), RFC 7520 (section 3), and RFC 8037 (appendix A): which ones `ParseJWKSet` keeps, with their kid and algorithm, and that `MarshalJWKSet` writes their members as the RFC prints them |
+| `TestJOSEExampleSignatures` | same | the tokens of RFC 7515 (A.2 to A.4), RFC 7520 (4.1 to 4.3), and RFC 8037 (A.5) verify with the key `ParseJWKSet` reads, through `fits` and the method `VerifyJWT` takes for the algorithm, and fail with a byte of the signature changed. A.2 and A.3 also go through `parse`. The other payloads are not claims, which `parse` decodes. |
+| `TestWycheproofSignatures` | `tests/crypto/wycheproof_test.go` | Wycheproof's signatures for each algorithm of `asymmetricAlgs`: the group's key through `ParseJWKSet`, and each signature through the method `VerifyJWT` takes |
+
+The examples have no audience, which `VerifyJWT` requires, so they run through its steps rather than through it whole. Their keys and tokens are in `crypto/jose_vectors_data_test.go`, copied from the RFC texts by a script. The Wycheproof files are in `tests/crypto/testdata/wycheproof`, with their commit and license, so that the module applications download does not carry 2.5 MB of test data.
+
+Two kinds of Wycheproof vector pass that a strict verifier refuses:
+
+- A PSS signature with a salt length other than the hash's verifies (`docs/ongoing.md`, M36). The test counts these, and fails on any other invalid signature that verifies.
+- An Ed25519 key of small or mixed order is kept, and signatures under it verify (M37). Wycheproof marks these acceptable.
 
 ## Invariants
 

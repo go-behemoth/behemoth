@@ -98,3 +98,9 @@ Sign-in hashes the attempted password and throws the hash away when it refuses b
 - Every password hash goes through `PasswordHasher` with the operation's context. Code that calls `argon2` itself is not counted in the room.
 - A decoy hash's error is returned. Dropped, a busy server answers `401` for an unknown email and `503` for a known one.
 - The room is per process. Replicas don't share it, and each one's memory is bounded on its own.
+
+## Published test vectors
+
+`TestArgon2idHasher_ReferenceVectors` (`crypto/password_hasher_test.go`) decodes the eight Argon2id hashes of version 1.3 in the reference implementation's `src/test.c` ([phc-winner-argon2](https://github.com/P-H-C/phc-winner-argon2)), with `decodeHash`, and checks that the hasher derives each key from its password and salt. It calls `deriveKey`, not `Verify`: `Verify` peppers the password first, and the pepper's HMAC-SHA256 is checked against RFC 4231 instead ([`keys.md`](keys.md)).
+
+RFC 9106's own vector has nothing to check here. It uses Argon2's secret and associated data inputs, for which `golang.org/x/crypto/argon2` takes no argument, and that package checks the vector in its own tests.

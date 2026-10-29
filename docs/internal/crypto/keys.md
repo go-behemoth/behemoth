@@ -124,5 +124,9 @@ The tests pin each of them with known answers computed outside the code under te
 | `TestDefaultKeyManager_UpdateThatChangesNothing` | same | an update that changes nothing is neither logged nor audited |
 | `TestDefaultKeyManager_RefusesANewSecretForAHeldVersion` | same | an update that changes a held version's secret is refused whole, with an Error line that does not carry the secret, also when it adds a version or moves the current one |
 | `TestSealKnownAnswer`, `TestSealIsBoundToItsOwnerAndPurpose` | `tests/store/seal_test.go` | the sealed form of a known value and binding, which pins the encoding; another owner or purpose is refused; a binding without both fields is an error |
+| `TestHMACSHA256_RFC4231` | `crypto/vectors_test.go` | the signer's and the secret hasher's HMAC-SHA256 under RFC 4231's keys, test cases 1 to 4, 6, and 7 |
+| `TestKeyManagerDerivesWithHKDF_RFC5869` | same | the key manager's HKDF-SHA256 with RFC 5869's test case 3, the one without a salt |
+| `TestDerivedKeySetSigns_RFC8032` | same | the derived key set's Ed25519 public keys and signatures for RFC 8032's tests 1 to 3 and RFC 8037's appendix A.4 |
+| `TestWycheproofAESGCM` | `tests/crypto/wycheproof_test.go` | the encryptor's sealed form and opening for Wycheproof's AES-256-GCM vectors with a 12-byte nonce and a 16-byte tag; an invalid one is refused with `invalid_payload` |
 
-The known answers were computed with Python's standard library (`hmac`, `hashlib`, and an HKDF checked against RFC 5869 test case 3) and its `cryptography` package for AES-GCM.
+The known answers of the tests not named after an RFC or Wycheproof were computed with Python's standard library (`hmac`, `hashlib`, and an HKDF checked against RFC 5869 test case 3) and its `cryptography` package for AES-GCM. The others run published vectors through the services. Some published vectors have nothing to check here: RFC 5869's cases 1 and 2 have a salt, which the key manager does not use, RFC 4231's case 5 truncates the output, and Behemoth uses no HMAC-SHA512. The Wycheproof files are in `tests/crypto/testdata/wycheproof`, outside the module applications download.

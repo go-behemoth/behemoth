@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"runtime"
 	"strings"
@@ -306,4 +307,49 @@ func TestParams_Floors(t *testing.T) {
 	ok, err := h.Verify(t.Context(), hash, "password")
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// A hash made by Argon2's reference implementation decodes to its
+// parameters, and the hasher derives the same key from its password: the
+// eight Argon2id vectors of version 1.3 in the reference implementation's
+// src/test.c (github.com/P-H-C/phc-winner-argon2), each with its hex output
+// and its encoded hash. They are not run through Verify, which peppers the
+// password with HMAC-SHA256 first (checked against RFC 4231 in
+// vectors_test.go). RFC 9106's vector needs Argon2's secret and associated
+// data, which golang.org/x/crypto/argon2 takes no argument for; that
+// package checks it in its own tests.
+func TestArgon2idHasher_ReferenceVectors(t *testing.T) {
+	// Room for one hash of the largest vector, 256 MiB.
+	h := newHasher(t, newPasswordKeys(t), &Params{Memory: 256 * 1024}, PasswordLimit{MaxConcurrent: 1}, nil)
+	for _, tc := range []struct {
+		name, password, hex, encoded string
+	}{
+		{"t=2 m=2^16 p=1", "password", "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7",
+			"$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc"},
+		{"t=2 m=2^18 p=1", "password", "78fe1ec91fb3aa5657d72e710854e4c3d9b9198c742f9616c2f085bed95b2e8c",
+			"$argon2id$v=19$m=262144,t=2,p=1$c29tZXNhbHQ$eP4eyR+zqlZX1y5xCFTkw9m5GYx0L5YWwvCFvtlbLow"},
+		{"t=2 m=2^8 p=1", "password", "9dfeb910e80bad0311fee20f9c0e2b12c17987b4cac90c2ef54d5b3021c68bfe",
+			"$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"},
+		{"t=2 m=2^8 p=2", "password", "6d093c501fd5999645e0ea3bf620d7b8be7fd2db59c20d9fff9539da2bf57037",
+			"$argon2id$v=19$m=256,t=2,p=2$c29tZXNhbHQ$bQk8UB/VmZZF4Oo79iDXuL5/0ttZwg2f/5U52iv1cDc"},
+		{"t=1 m=2^16 p=1", "password", "f6a5adc1ba723dddef9b5ac1d464e180fcd9dffc9d1cbf76cca2fed795d9ca98",
+			"$argon2id$v=19$m=65536,t=1,p=1$c29tZXNhbHQ$9qWtwbpyPd3vm1rB1GThgPzZ3/ydHL92zKL+15XZypg"},
+		{"t=4 m=2^16 p=1", "password", "9025d48e68ef7395cca9079da4c4ec3affb3c8911fe4f86d1a2520856f63172c",
+			"$argon2id$v=19$m=65536,t=4,p=1$c29tZXNhbHQ$kCXUjmjvc5XMqQedpMTsOv+zyJEf5PhtGiUghW9jFyw"},
+		{"another password", "differentpassword", "0b84d652cf6b0c4beaef0dfe278ba6a80df6696281d7e0d2891b817d8c458fde",
+			"$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$C4TWUs9rDEvq7w3+J4umqA32aWKB1+DSiRuBfYxFj94"},
+		{"another salt", "password", "bdf32b05ccc42eb15d58fd19b1f856b113da1e9a5874fdcc544308565aa8141c",
+			"$argon2id$v=19$m=65536,t=2,p=1$ZGlmZnNhbHQ$vfMrBczELrFdWP0ZsfhWsRPaHppYdP3MVEMIVlqoFBw"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			params, keyVersion, salt, key, err := decodeHash(tc.encoded)
+			require.NoError(t, err)
+			assert.Equal(t, 0, keyVersion, "the reference format has no key version")
+			assert.Equal(t, tc.hex, hex.EncodeToString(key))
+
+			derived, err := h.deriveKey(t.Context(), "test", []byte(tc.password), salt, params)
+			require.NoError(t, err)
+			assert.Equal(t, key, derived)
+		})
+	}
 }
