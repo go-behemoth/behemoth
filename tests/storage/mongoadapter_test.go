@@ -1,31 +1,14 @@
 package models
 
 import (
-	"context"
-	"log"
-	"os"
 	"testing"
 
 	"github.com/go-behemoth/behemoth/clause"
 	mongoAdapter "github.com/go-behemoth/behemoth/storage/adapters/mongo"
-	"github.com/go-behemoth/behemoth/tests/testutils"
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-func TestMain(m *testing.M) {
-	ctx := context.Background()
-	mongoClient, cleanupMongo := testutils.SetupMongoTestDB(ctx, nil)
-
-	code := m.Run()
-
-	if err := testutils.CleanupMongoTestDB(ctx, nil, mongoClient, testutils.MongoDBName); err != nil {
-		log.Fatalf("failed to clean up MongoDB: %v", err)
-	}
-
-	cleanupMongo()
-	os.Exit(code)
-}
 func TestBuildMongoFilter(t *testing.T) {
 	tests := []struct {
 		name     string

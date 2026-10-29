@@ -49,6 +49,14 @@ Tags are never moved or deleted after they are pushed.
 
 ## Unreleased
 
+### Fixed
+
+- The error for a circular dependency, among plugins, hook handlers, migrations, or schema operations, names the nodes of one cycle. Before, it could name a node that only depended on the cycle and stop at a node outside it, and the path could change from one run to the next.
+
+### Security
+
+- `TokenCatalog.Declare` returns a configuration error for a single-use token kind with `core.TokenBackendKV`, and `TokenManager.Consume` refuses one. `Consume` returned such a token as consumed but left it in the key-value storage, where it worked again until it expired. No plugin of Behemoth declares such a kind. If yours does, declare it with `core.TokenBackendDB`.
+
 ## [0.2.0] - 2026-10-28
 
 ### Added
