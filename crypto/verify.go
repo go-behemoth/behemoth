@@ -30,7 +30,8 @@ type VerifyOptions struct {
 	Algorithms []string
 
 	// Leeway is the clock skew allowed on exp, nbf, and iat. Zero means
-	// none.
+	// none. It is at most five minutes: a longer one is a configuration
+	// error.
 	Leeway time.Duration
 
 	// CheckIssuedAt refuses a token whose iat is later than now plus
@@ -75,17 +76,21 @@ func (t *VerifiedJWT) Claims(v any) error {
 
 // VerifyJWT checks a JWT signed with a key of keys, and returns it.
 //
-// The header's alg has to be one of opts.Algorithms and fit the key: the key
-// its kid names, which signs with its own algorithm or, when it names none,
-// with one its type allows. The algorithm is never taken from the header
-// alone. The signature is checked before the claims. Then exp is required,
-// nbf and iat are checked, iss has to be one of opts.Issuers, and aud has to
-// hold one of opts.Audiences.
+// A token over 64 KiB, or with a header over 8 KiB, is refused before it is
+// decoded, with errs.CodeJWTTooLarge. The token is three segments of
+// base64url without padding, in their one encoding. The header's alg has to
+// be one of opts.Algorithms and fit the key: the key its kid names, which
+// signs with its own algorithm or, when it names none, with one its type
+// allows. The algorithm is never taken from the header alone, and neither is
+// a key. The signature is checked before the claims are decoded. Then exp is
+// required, nbf and iat are checked, iss has to be one of opts.Issuers, and
+// aud has to hold one of opts.Audiences.
 //
 // A refused token is a CategoryToken error with one of the codes of
-// errors/jwt.go. When keys can't get its keys, its error is returned: a
-// failure of the system. Options without an issuer or an audience, or with
-// an algorithm that is not asymmetric, are a configuration error.
+// errs/jwt.go. When keys can't get its keys, its error is returned: a
+// failure of the system. Options without an issuer or an audience, with an
+// algorithm that is not asymmetric, or with a leeway over five minutes are a
+// configuration error.
 func VerifyJWT(ctx context.Context, token string, keys KeySet, opts VerifyOptions) (*VerifiedJWT, error) {
 	const op = "crypto.VerifyJWT"
 	algs, err := opts.check(keys)
@@ -97,8 +102,7 @@ func VerifyJWT(ctx context.Context, token string, keys KeySet, opts VerifyOption
 		now = time.Now
 	}
 
-	claims := jwt.MapClaims{}
-	p, err := parse(op, token, claims)
+	p, err := parse(op, token)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +124,10 @@ func VerifyJWT(ctx context.Context, token string, keys KeySet, opts VerifyOption
 		return nil, errs.NewJWTError(op, errs.CodeJWTInvalidSignature, verifyErr)
 	}
 
+	claims := jwt.MapClaims{}
+	if err := p.decodeClaims(op, &claims); err != nil {
+		return nil, err
+	}
 	checks := []jwt.ParserOption{
 		jwt.WithExpirationRequired(), jwt.WithAudience(opts.Audiences...),
 		jwt.WithLeeway(opts.Leeway), jwt.WithTimeFunc(now),
@@ -139,6 +147,11 @@ func VerifyJWT(ctx context.Context, token string, keys KeySet, opts VerifyOption
 	return verifiedOf(op, p, claims)
 }
 
+// maxLeeway is the most clock skew VerifyOptions.Leeway may allow. Servers
+// whose clocks NTP keeps are within a second of each other. A longer leeway
+// only lets a token be used for that much longer after it expires.
+const maxLeeway = 5 * time.Minute
+
 // check returns the algorithms a token may name, or why the options can't
 // work.
 func (o VerifyOptions) check(keys KeySet) ([]string, error) {
@@ -151,6 +164,8 @@ func (o VerifyOptions) check(keys KeySet) ([]string, error) {
 		return nil, errors.New("VerifyOptions.Audiences is empty or holds an empty audience; a token is accepted by the service it was issued for")
 	case o.Leeway < 0:
 		return nil, fmt.Errorf("VerifyOptions.Leeway is negative: %s", o.Leeway)
+	case o.Leeway > maxLeeway:
+		return nil, fmt.Errorf("VerifyOptions.Leeway is %s, over the most allowed, %s", o.Leeway, maxLeeway)
 	}
 	if len(o.Algorithms) == 0 {
 		return asymmetricAlgs, nil

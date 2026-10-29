@@ -83,33 +83,75 @@ The checks run in this order, and the first that fails decides the code:
 
 | # | Check | Refused with |
 | --- | --- | --- |
-| 1 | the options: an issuer, an audience, asymmetric algorithms only, no negative leeway | a configuration error |
-| 2 | the token parses, and its header has no `crit` | `CodeJWTMalformed` |
+| 1 | the options: an issuer, an audience, asymmetric algorithms only, a leeway from zero to five minutes (`maxLeeway`) | a configuration error |
+| 2 | `parse`: the token's size, its segments, and its header (see *Reading a token*) | `CodeJWTTooLarge` or `CodeJWTMalformed` |
 | 3 | `alg` is one of the options' algorithms, by default `asymmetricAlgs` | `CodeJWTAlgorithmMismatch` |
 | 4 | `candidateKeys`: the key `kid` names, and it fits `alg`; or, with the same `kid`, another key that fits (RFC 7517, section 4.5). Without a `kid`, with `AllowMissingKID`: every key that fits. | the set's error, `CodeJWTUnknownKey`, or `CodeJWTAlgorithmMismatch` |
 | 5 | the signature, with each candidate until one matches | `CodeJWTInvalidSignature` |
-| 6 | golang-jwt's validator: `exp` required, `nbf`, `aud` holds one of the audiences, `iat` with `CheckIssuedAt`, all with the leeway and the options' clock | `checkClaims`: the code of the check |
-| 7 | `iss` is one of the issuers. golang-jwt checks a single issuer, and Google has two forms. | `CodeJWTIssuerMismatch` |
-| 8 | `sub`, `aud`, `jti`, and the dates have their types | `CodeJWTInvalidClaims` |
+| 6 | `decodeClaims`: the payload is a JSON object | `CodeJWTMalformed` |
+| 7 | golang-jwt's validator: `exp` required, `nbf`, `aud` holds one of the audiences, `iat` with `CheckIssuedAt`, all with the leeway and the options' clock | `checkClaims`: the code of the check |
+| 8 | `iss` is one of the issuers. golang-jwt checks a single issuer, and Google has two forms. | `CodeJWTIssuerMismatch` |
+| 9 | `sub`, `aud`, `jti`, and the dates have their types | `CodeJWTInvalidClaims` |
 
 `fits` is the ADR's rule for the algorithm: a key that names one signs with it alone, and every key signs only with an algorithm of its type (`algorithmsOf`). The second half also catches a `KeySet` that pairs a key with an algorithm of another type.
 
-`externalJWT.verify` calls `VerifyJWT` with the configured issuer and the external audiences, no leeway, and `iat` unchecked, as before the move. It decodes `wireClaims` from `VerifiedJWT.Claims` and builds `crypto.Claims` with `claimsOf`. Internal tokens keep their own path: they are HS256, and `VerifyJWT` refuses every symmetric algorithm. They share `parse` and `checkClaims`.
+`externalJWT.verify` calls `VerifyJWT` with the configured issuer and the external audiences, no leeway, and `iat` unchecked, as before the move. It decodes `wireClaims` from `VerifiedJWT.Claims` and builds `crypto.Claims` with `claimsOf`. Internal tokens keep their own path: they are HS256, and `VerifyJWT` refuses every symmetric algorithm. They share `parse`, `decodeClaims`, and `checkClaims`.
+
+An internal token's `kid` is its key's version, in the decimal form `sign` writes. Another form of a number (`01`, `+1`, ` 1`) is refused with `CodeJWTUnknownKey`, as the derived key set refuses it for external tokens. So is a version the key manager does not hold: the signer returns the key manager's security error with `errs.CodeUnknownKeyVersion`, which `internalJWT.verify` turns into a refused token. The version came from the client, and before the change it was answered with a `500`.
+
+### Reading a token
+
+`parse` reads a token for both kinds, and for `VerifyJWT`, without verifying anything. It decodes the header and the signature, and leaves the payload as bytes: `decodeClaims` reads it once the signature is checked, so the claims of a forged token are never decoded.
+
+| Refused | With |
+| --- | --- |
+| a token over 64 KiB (`maxTokenSize`), or a header over 8 KiB (`maxHeaderSize`), as encoded. Nothing of it is decoded. | `CodeJWTTooLarge` |
+| anything but three segments of base64url without padding, decoded strictly (RFC 7515, section 2) | `CodeJWTMalformed` |
+| a header that is not a JSON object, an `alg` that is missing or not a string, a `kid` that is not a string | `CodeJWTMalformed` |
+| a header with `crit`, whatever it lists. No extension is understood, and RFC 7515 section 4.1.11 then fails the token. | `CodeJWTMalformed` |
+
+A JWT is a few hundred bytes to a few kilobytes. The largest carry long lists of groups or roles, and a certificate chain in `x5c` adds a few kilobytes to a header. The limits are four to eight times that, and bound the work a token from a client costs before anything of it is trusted.
+
+Strict decoding and the alphabet check give a token one encoding. Go's base64 decoder skips line breaks, and outside its strict mode it ignores the unused bits of the last character. The signature is not part of what it signs, so before the change a signature segment with those bits set, or with a line break in it, verified. One token had up to 16 strings: anything that recognizes a token by its string, such as a deny list of their hashes, could be passed by another of them. Header, `jku`, `x5u`, `x5c`, and `jwk` members are never read: the key comes from the key set alone.
 
 ## Published test vectors
 
 | Test | File | Covers |
 | --- | --- | --- |
 | `TestJOSEExampleKeys` | `crypto/jose_vectors_test.go` | the JWKs of RFC 7515 (appendix A), RFC 7517 (appendices A and B), RFC 7520 (section 3), and RFC 8037 (appendix A): which ones `ParseJWKSet` keeps, with their kid and algorithm, and that `MarshalJWKSet` writes their members as the RFC prints them |
-| `TestJOSEExampleSignatures` | same | the tokens of RFC 7515 (A.2 to A.4), RFC 7520 (4.1 to 4.3), and RFC 8037 (A.5) verify with the key `ParseJWKSet` reads, through `fits` and the method `VerifyJWT` takes for the algorithm, and fail with a byte of the signature changed. A.2 and A.3 also go through `parse`. The other payloads are not claims, which `parse` decodes. |
+| `TestJOSEExampleSignatures` | same | the tokens of RFC 7515 (A.2 to A.4), RFC 7520 (4.1 to 4.3), and RFC 8037 (A.5) verify with the key `ParseJWKSet` reads, through `parse`, `fits`, and the method `VerifyJWT` takes for the algorithm, and fail with a byte of the signature changed |
 | `TestWycheproofSignatures` | `tests/crypto/wycheproof_test.go` | Wycheproof's signatures for each algorithm of `asymmetricAlgs`: the group's key through `ParseJWKSet`, and each signature through the method `VerifyJWT` takes |
+| `TestWycheproofJOSE` | `tests/crypto/wycheproof_jose_test.go` | Wycheproof's JWS and key set vectors through `VerifyJWT`, with the public halves of the group's keys in a `CachedKeySet` |
 
-The examples have no audience, which `VerifyJWT` requires, so they run through its steps rather than through it whole. Their keys and tokens are in `crypto/jose_vectors_data_test.go`, copied from the RFC texts by a script. The Wycheproof files are in `tests/crypto/testdata/wycheproof`, with their commit and license, so that the module applications download does not carry 2.5 MB of test data.
+The examples have no audience, which `VerifyJWT` requires, so they run through its steps rather than through it whole. Their keys and tokens are in `crypto/jose_vectors_data_test.go`, copied from the RFC texts by a script. The Wycheproof files are in `tests/crypto/testdata/wycheproof`, with their commit and license, so that the module applications download does not carry 2.8 MB of test data.
 
-Two kinds of Wycheproof vector pass that a strict verifier refuses:
+The JOSE vectors' payloads are not claims, so `VerifyJWT` refuses even a valid one, once its signature has verified, with `CodeJWTMalformed`. A token refused for its structure has that code too. `TestWycheproofJOSE` tells the two apart with the same token and zeros for its signature: when the structure is fine, that one is refused with `CodeJWTInvalidSignature`. A valid vector gets past its signature, and an invalid one does not, with these exceptions, which the test lists by `tcId`:
 
-- A PSS signature with a salt length other than the hash's verifies (`docs/ongoing.md`, M36). The test counts these, and fails on any other invalid signature that verifies.
+- Valid vectors of HMAC keys are refused: `VerifyJWT` takes no symmetric algorithm.
+- Five valid vectors are refused on purpose. Their keys, Wycheproof's copies of RFC 7520's, name `PS256` for a `PS384` token, name `ES521`, which is no JWS algorithm, or hold the one operation `"sign, verify"` in `key_ops`. RFC 7517 lets none of them verify the token.
+- Invalid vectors that get past their signature: the six PSS signatures with another salt length (M36), and the key with the ROCA weakness (M40).
+
+Two kinds of signature vector pass that a strict verifier refuses:
+
+- A PSS signature with a salt length other than the hash's verifies (`docs/ongoing.md`, M36). The tests count these, and fail on any other invalid signature that verifies.
 - An Ed25519 key of small or mixed order is kept, and signatures under it verify (M37). Wycheproof marks these acceptable.
+
+## Negative tests
+
+`crypto/token_refusals_test.go` holds one test for each kind of attack. Most run on the three paths a token is verified on: `VerifyJWT` with another issuer's keys, and the internal and external tokens of the provider.
+
+| Test | Covers |
+| --- | --- |
+| `TestVerifyRefusesTheNoneAlgorithm` | `none` in four cases, an empty `alg`, no `alg`, and an `alg` that is not a string, with and without a signature |
+| `TestVerifyRefusesAlgorithmConfusion` | HS256, HS384, and HS512 whose secret is the verifier's public key as DER, PEM, a JWK, a JWK set, or its raw bytes, for RSA, EC, and Ed25519 keys, and the published keys against internal tokens |
+| `TestVerifyRefusesAnUnknownOrInjectedKID` | kids with paths, quotes, URLs, nul bytes, case and spaces changed; kids that are not strings; keys the token carries in `jwk`, `jku`, `x5u`, and `x5c`; other forms of a version number for both kinds |
+| `TestVerifyEnforcesTheTimeClaims` | `exp`, `nbf`, and `iat` to the second, with and without a leeway, and of the wrong type; the leeway's bound |
+| `TestVerifyRefusesAnotherIssuerOrAudience` | an issuer or an audience with a trailing slash, in capitals, over `http`, of the wrong type, empty, or missing |
+| `TestVerifyRefusesOversizedTokens` | a token and a header just within the limits, which verify, and just beyond them, which are refused before a key is looked up |
+| `TestVerifyRefusesCriticalHeaders` | `crit` with a registered name, `b64`, a known or an unknown extension, an empty list, a string, and `null` |
+| `TestVerifyRefusesNonCanonicalEncodings` | a signature with its unused bits set, padding, a line break, a carriage return, a space, and the standard alphabet |
+
+The fetches an unknown `kid` causes are spaced by `RefetchInterval`, which `TestCachedKeySetRefetchesForAnUnknownKID` covers: a stream of injected kids is not a stream of fetches.
 
 ## Invariants
 
@@ -117,7 +159,8 @@ These invariants hold:
 
 - **`crypto` makes no outbound call.** The codec reads bytes. A source fetches them.
 - **A token's algorithm comes from the caller's list and from its key**, never from the header alone. `none` and the HMAC algorithms can't be listed.
-- **The signature is checked before any claim.** A forged token learns nothing from which claim fails.
+- **The signature is checked before any claim.** The claims of a token are decoded only once its signature is, so a forged token learns nothing from which claim fails, and its payload is never parsed.
+- **A token has one encoding.** Its segments are canonical base64url, so a token can't be changed into another string that verifies.
 - **A token is accepted from a trusted issuer, for this service.** `VerifyJWT` refuses to run without both.
 - **A failure to get the keys is never a refused token.** It is returned as it is, so that a route answers with a 5xx and not a 401.
 - **A written set holds public keys only.** `MarshalJWKSet` refuses a private key, and `jwk` has no private member.

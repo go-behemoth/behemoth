@@ -2,7 +2,6 @@ package crypto
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -79,41 +78,22 @@ func TestJOSEExampleKeys(t *testing.T) {
 	}
 }
 
-// compactParts splits a compact JWS into its header's alg and kid, its
-// signing input, and its signature, without reading the payload: parse
-// reads the payload as claims, which only RFC 7515's A.2 and A.3 have.
-func compactParts(t *testing.T, token string) (alg, kid, signingString string, signature []byte) {
-	t.Helper()
-	parts := strings.Split(token, ".")
-	require.Len(t, parts, 3)
-	header, err := base64.RawURLEncoding.DecodeString(parts[0])
-	require.NoError(t, err)
-	var h struct {
-		Alg string `json:"alg"`
-		Kid string `json:"kid"`
-	}
-	require.NoError(t, json.Unmarshal(header, &h))
-	signature, err = base64.RawURLEncoding.DecodeString(parts[2])
-	require.NoError(t, err)
-	return h.Alg, h.Kid, parts[0] + "." + parts[1], signature
-}
-
 // The signature of each example verifies with the key ParseJWKSet reads
-// from the RFC's JWK, through the method VerifyJWT takes for the token's
-// alg, and fails with a byte changed. The examples have no audience, which
-// VerifyJWT requires, so they are not run through it whole.
+// from the RFC's JWK, through parse, fits, and the method VerifyJWT takes
+// for the token's alg, and fails with a byte changed. The examples have no
+// audience, which VerifyJWT requires, so they are not run through it whole.
+// Most payloads are not claims either, which parse does not read.
 func TestJOSEExampleSignatures(t *testing.T) {
 	for _, tc := range []struct {
-		name, key, token, alg string
-		claims                bool // the payload is a JSON object, which parse reads
+		name, key, token, alg, kid string
 	}{
-		{"RFC 7515 A.2", rfc7515A2Key, rfc7515A2JWS, "RS256", true},
-		{"RFC 7515 A.3", rfc7515A3Key, rfc7515A3JWS, "ES256", true},
-		{"RFC 7515 A.4", rfc7515A4Key, rfc7515A4JWS, "ES512", false},
-		{"RFC 7520 4.1", rfc7520RSAKey, rfc7520RS256JWS, "RS256", false},
-		{"RFC 7520 4.2", rfc7520RSAKey, rfc7520PS384JWS, "PS384", false},
-		{"RFC 7520 4.3", rfc7520ECKey, rfc7520ES512JWS, "ES512", false},
-		{"RFC 8037 A.5", rfc8037PublicKey, rfc8037JWS, "EdDSA", false},
+		{"RFC 7515 A.2", rfc7515A2Key, rfc7515A2JWS, "RS256", ""},
+		{"RFC 7515 A.3", rfc7515A3Key, rfc7515A3JWS, "ES256", ""},
+		{"RFC 7515 A.4", rfc7515A4Key, rfc7515A4JWS, "ES512", ""},
+		{"RFC 7520 4.1", rfc7520RSAKey, rfc7520RS256JWS, "RS256", "bilbo.baggins@hobbiton.example"},
+		{"RFC 7520 4.2", rfc7520RSAKey, rfc7520PS384JWS, "PS384", "bilbo.baggins@hobbiton.example"},
+		{"RFC 7520 4.3", rfc7520ECKey, rfc7520ES512JWS, "ES512", "bilbo.baggins@hobbiton.example"},
+		{"RFC 8037 A.5", rfc8037PublicKey, rfc8037JWS, "EdDSA", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			keys, err := ParseJWKSet(setOf(tc.key))
@@ -121,24 +101,20 @@ func TestJOSEExampleSignatures(t *testing.T) {
 			require.Len(t, keys, 1)
 			key := keys[0]
 
-			alg, kid, signingString, signature := compactParts(t, tc.token)
-			require.Equal(t, tc.alg, alg)
-			if tc.claims {
-				p, err := parse("test", tc.token, jwt.MapClaims{})
-				require.NoError(t, err)
-				assert.Equal(t, alg, p.alg)
-				assert.Equal(t, kid, p.kid)
-				assert.Equal(t, signingString, p.signingString)
-				assert.Equal(t, signature, p.signature)
-			}
-			assert.Equal(t, kid, key.KID)
-			require.True(t, fits(key, alg), "the key does not fit %s", alg)
+			p, err := parse("test", tc.token)
+			require.NoError(t, err)
+			require.Equal(t, tc.alg, p.alg)
+			assert.Equal(t, tc.kid, p.kid)
+			parts := strings.Split(tc.token, ".")
+			assert.Equal(t, parts[0]+"."+parts[1], p.signingString)
+			assert.Equal(t, tc.kid, key.KID)
+			require.True(t, fits(key, p.alg), "the key does not fit %s", p.alg)
 
-			method := jwt.GetSigningMethod(alg)
-			assert.NoError(t, method.Verify(signingString, signature, key.Key))
-			changed := bytes.Clone(signature)
+			method := jwt.GetSigningMethod(p.alg)
+			assert.NoError(t, method.Verify(p.signingString, p.signature, key.Key))
+			changed := bytes.Clone(p.signature)
 			changed[len(changed)/2] ^= 1
-			assert.Error(t, method.Verify(signingString, changed, key.Key), "a changed signature")
+			assert.Error(t, method.Verify(p.signingString, changed, key.Key), "a changed signature")
 		})
 	}
 }
