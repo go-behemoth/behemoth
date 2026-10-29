@@ -565,7 +565,7 @@ The settings have since moved with the HTTP side of the session manager to the t
 
 - *Constructors, such as `oauth.Google(cfg)`, that return a `Provider`.* Short in Go. A configuration file still can't name a provider, and a service would have to map each kind to a constructor itself.
 - *A second option for the data, next to `Providers`.* No rename. The common case gets the longer name.
-- *`Providers` for the data, and `CustomProviders` for the application's own.* The common case reads naturally. The plugin's earlier `Options.Providers` changes type, which an experimental plugin can still do.
+- *`Providers` for the data, and `CustomProviders` for the application's own.* The common case reads naturally. The plugin's earlier `Options.Providers` changes type, which a `v0.x` release can still do.
 
 **Decision:** `Providers []ProviderConfig` and `CustomProviders []Provider`.
 

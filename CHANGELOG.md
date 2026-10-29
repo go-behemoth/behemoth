@@ -49,9 +49,20 @@ Tags are never moved or deleted after they are pushed.
 
 ## Unreleased
 
+### Added
+
+- The README has a quick start that you can run from an empty directory to a first sign-up and sign-in against PostgreSQL. `examples/quickstart` holds the same code, and a test fails when the README's code differs from it.
+- The [Hooks](docs/api/hooks.md#choose-what-happens-when-counting-fails) page documents `RateLimitConfig.FailureMode`: what happens to a request when the storage of a rate limit can't count an attempt. `core.FailOpen` is the default, and `core.FailClosed` refuses the request.
+- The [Callers](docs/api/callers.md) page lists the permissions of the two-factor plugin: `two_factor:read`, `two_factor:manage`, and `user:reset_two_factor`.
+
+### Changed
+
+- The [OAuth plugin](docs/api/oauth.md) is no longer experimental. Sign-in, linking and unlinking provider accounts, listing them, and stored provider tokens with refresh and revocation are all built. As in the rest of Behemoth, its API can change until `v1.0.0`.
+
 ### Fixed
 
 - The error for a circular dependency, among plugins, hook handlers, migrations, or schema operations, names the nodes of one cycle. Before, it could name a node that only depended on the cycle and stop at a node outside it, and the path could change from one run to the next.
+- The code samples for a route in the Sessions, Routers, Email verification, and Telemetry pages are complete and compile. Before, they were fragments, such as a route literal outside a function, and one ended in `...`.
 
 ### Security
 
