@@ -2,7 +2,7 @@
 
 The JSON files in this directory are copied unchanged from [Project Wycheproof](https://github.com/C2SP/wycheproof), directory `testvectors_v1`, at commit `d17cc89fa5c8f4f4d378b5385ebf75da5d0926c9` (2026-10-23). Wycheproof is licensed under the Apache License 2.0, in [`LICENSE`](LICENSE).
 
-`tests/crypto/wycheproof_test.go` runs them:
+`tests/crypto/wycheproof_test.go` and `tests/crypto/wycheproof_jose_test.go` run them:
 
 | File | Runs through |
 | --- | --- |
@@ -17,6 +17,8 @@ The JSON files in this directory are copied unchanged from [Project Wycheproof](
 | `rsa_pss_4096_sha384_mgf1_48_test.json` | `ParseJWKSet` and the PS384 method |
 | `rsa_pss_4096_sha512_mgf1_64_test.json` | `ParseJWKSet` and the PS512 method |
 | `ed25519_test.json` | `ParseJWKSet` and the EdDSA method |
+| `json_web_signature_test.json` | `VerifyJWT`, with each group's public key in a `CachedKeySet` |
+| `json_web_key_test.json` | `VerifyJWT`, with each group's public keys in a `CachedKeySet` |
 
 The ECDSA files are the IEEE P1363 ones, whose signatures are `r` and `s` side by side, as in a JWS. The other files are the ones whose hash, salt length, and mask generation function are those of the JWS algorithm (RFC 7518, section 3).
 

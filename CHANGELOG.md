@@ -54,19 +54,28 @@ Tags are never moved or deleted after they are pushed.
 - The README has a quick start that you can run from an empty directory to a first sign-up and sign-in against PostgreSQL. `examples/quickstart` holds the same code, and a test fails when the README's code differs from it.
 - The [Hooks](docs/api/hooks.md#choose-what-happens-when-counting-fails) page documents `RateLimitConfig.FailureMode`: what happens to a request when the storage of a rate limit can't count an attempt. `core.FailOpen` is the default, and `core.FailClosed` refuses the request.
 - The [Callers](docs/api/callers.md) page lists the permissions of the two-factor plugin: `two_factor:read`, `two_factor:manage`, and `user:reset_two_factor`.
+- `errs.CodeJWTTooLarge` (`token_too_large`). `crypto.VerifyJWT` and `JWTProvider.Verify` refuse a token over 64 KiB, or with a header over 8 KiB, with it, before any of the token is decoded.
+- `errs.CodeUnknownKeyVersion`, the code of the error the key manager returns for a key version it does not hold. A `crypto.KeyManager` of your own returns it too, so that an internal JWT naming such a version is a refused token.
 
 ### Changed
 
 - The [OAuth plugin](docs/api/oauth.md) is no longer experimental. Sign-in, linking and unlinking provider accounts, listing them, and stored provider tokens with refresh and revocation are all built. As in the rest of Behemoth, its API can change until `v1.0.0`.
+- `VerifyOptions.Leeway` over five minutes is a configuration error.
+- `VerifyJWT` and `JWTProvider.Verify` check the signature before they decode the claims. A token whose signature does not match is refused with `invalid_signature`, also when its claims are not a JSON object, which was `malformed_token`.
+- A header without `alg`, or with an `alg` or a `kid` that is not a string, is refused with `malformed_token`. A missing `alg` was `algorithm_mismatch`, and a `kid` that was not a string was read as no `kid`.
+- An internal JWT whose `kid` is not its key version as Behemoth writes it, such as `01`, `+1`, or a word, is refused with `unknown_signing_key`. A `kid` that was not a number was `malformed_token`, and `01` or `+1` was read as version 1.
 
 ### Fixed
 
 - The error for a circular dependency, among plugins, hook handlers, migrations, or schema operations, names the nodes of one cycle. Before, it could name a node that only depended on the cycle and stop at a node outside it, and the path could change from one run to the next.
 - The code samples for a route in the Sessions, Routers, Email verification, and Telemetry pages are complete and compile. Before, they were fragments, such as a route literal outside a function, and one ended in `...`.
+- An internal JWT whose `kid` names a key version the key manager does not hold is refused with `unknown_signing_key`. It returned the key manager's security error, which a route answers with `500`.
 
 ### Security
 
 - `TokenCatalog.Declare` returns a configuration error for a single-use token kind with `core.TokenBackendKV`, and `TokenManager.Consume` refuses one. `Consume` returned such a token as consumed but left it in the key-value storage, where it worked again until it expired. No plugin of Behemoth declares such a kind. If yours does, declare it with `core.TokenBackendDB`.
+- A token's segments have to be base64url in their one encoding. A signature whose last character had its unused bits set, or with a line break in it, verified, so one token could be written as several strings that all verified. Such a token is refused with `malformed_token`.
+
 
 ## [0.2.0] - 2026-10-28
 

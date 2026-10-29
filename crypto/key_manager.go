@@ -157,7 +157,7 @@ func (km *DefaultKeyManager) deriveKey(purpose KeyPurpose, version int) ([]byte,
 
 	masterSecret, ok := km.secrets[version]
 	if !ok {
-		return nil, errs.NewSecurityError("KeyManager.Derive", "unknown_key_version",
+		return nil, errs.NewSecurityError("KeyManager.Derive", errs.CodeUnknownKeyVersion,
 			fmt.Errorf("no key material for version %d, purpose %q", version, purpose))
 	}
 

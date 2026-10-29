@@ -29,6 +29,9 @@ const (
 	// CodeJWTUnknownKey: the header names a key the key set does not
 	// have, or names none where a kid is required.
 	CodeJWTUnknownKey = "unknown_signing_key"
+	// CodeJWTTooLarge: the token, or its header, is longer than a
+	// verifier reads. It is refused before it is decoded.
+	CodeJWTTooLarge = "token_too_large"
 )
 
 // Codes of the errors for a JWT that could not be issued or checked because

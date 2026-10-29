@@ -55,6 +55,9 @@ type KeyManager interface {
 
 	// GetByVersion looks up a specific historical key - required for verifying
 	// or decrypting data signed/encrypted before the most recent rotation.
+	// A version the manager does not hold is a security error with the code
+	// errs.CodeUnknownKeyVersion, which the verifier of an internal JWT
+	// turns into a refused token.
 	GetByVersion(purpose KeyPurpose, version int) (key []byte, err error)
 
 	CurrentVersion() int
@@ -250,8 +253,11 @@ type JWTProvider interface {
 	// Sign issues a token of kind for req.
 	Sign(ctx context.Context, kind JWTKind, req JWTRequest) (token string, err error)
 
-	// Verify: Verifies a given token and returns the claim data.
-	// Algorithm must not be taken from the token header.
+	// Verify checks token as a token of kind and returns its claims. The
+	// algorithm is the kind's, never the header's. A refused token is a
+	// CategoryToken error with a code of errs/jwt.go, as VerifyJWT returns
+	// them: a key the provider does not hold, such as the key version an
+	// internal token's kid names, is errs.CodeJWTUnknownKey.
 	Verify(ctx context.Context, kind JWTKind, token string) (claims *Claims, err error)
 }
 

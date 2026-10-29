@@ -1,12 +1,16 @@
 package crypto
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-behemoth/behemoth"
@@ -70,6 +74,35 @@ func payload(op string, kind JWTKind, cfg JWTConfig, req JWTRequest) (jwt.MapCla
 	return claims, nil
 }
 
+// maxTokenSize and maxHeaderSize bound a token and its header, as they are
+// encoded. A longer one is refused before anything of it is decoded, so a
+// token costs little to refuse whatever its size. A JWT is a few hundred
+// bytes to a few kilobytes: the largest carry long lists of groups or
+// roles, and a certificate chain (x5c) adds a few kilobytes to a header.
+const (
+	maxTokenSize  = 64 << 10
+	maxHeaderSize = 8 << 10
+)
+
+// segmentEncoding decodes a segment: base64url without padding (RFC 7515,
+// section 2), strictly, so that the unused bits of the last character are
+// zero. With isBase64URL, which refuses the line breaks the decoder skips,
+// a segment has one encoding: a token can't be changed into another string
+// that verifies with the same signature.
+var segmentEncoding = base64.RawURLEncoding.Strict()
+
+// isBase64URL reports whether s holds only characters of the base64url
+// alphabet.
+func isBase64URL(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // parsed is a token read without its signature checked yet.
 type parsed struct {
 	alg           string
@@ -79,32 +112,73 @@ type parsed struct {
 	payload       []byte // the claims as they were signed, decoded from base64url
 }
 
-// parse reads token without verifying anything, and decodes its claims
-// into claims. A header with "crit" is refused: no extension is understood
-// here, and RFC 7515 section 4.1.11 then fails the token.
-func parse(op, token string, claims jwt.Claims) (*parsed, error) {
-	p := jwt.NewParser()
-	tok, parts, err := p.ParseUnverified(token, claims)
-	if err != nil {
-		if errors.Is(err, jwt.ErrTokenUnverifiable) {
-			return nil, errs.NewJWTError(op, errs.CodeJWTAlgorithmMismatch, err) // an algorithm golang-jwt does not know
+// parse reads token without verifying anything: its header, its signature,
+// and its payload, which decodeClaims reads as claims once the signature is
+// checked. A forged token is refused before its claims are decoded.
+//
+// A token longer than maxTokenSize, or a header longer than maxHeaderSize,
+// is refused with token_too_large before it is decoded. malformed_token
+// refuses a token that is not three segments of canonical base64url (RFC
+// 7515, section 7.1), a header that is not a JSON object whose alg is a
+// string, a kid that is not a string, and a header with "crit": no
+// extension is understood here, and RFC 7515 section 4.1.11 then fails the
+// token.
+func parse(op, token string) (*parsed, error) {
+	malformed := func(err error) error { return errs.NewJWTError(op, errs.CodeJWTMalformed, err) }
+	if len(token) > maxTokenSize {
+		return nil, errs.NewJWTError(op, errs.CodeJWTTooLarge, fmt.Errorf("the token is %d bytes, over %d", len(token), maxTokenSize))
+	}
+	segments := strings.Split(token, ".")
+	if len(segments) != 3 {
+		return nil, malformed(fmt.Errorf("the token has %d segments, not 3", len(segments)))
+	}
+	if len(segments[0]) > maxHeaderSize {
+		return nil, errs.NewJWTError(op, errs.CodeJWTTooLarge, fmt.Errorf("the header is %d bytes, over %d", len(segments[0]), maxHeaderSize))
+	}
+	var decoded [3][]byte
+	for i, segment := range segments {
+		if !isBase64URL(segment) {
+			return nil, malformed(fmt.Errorf("segment %d is not base64url", i+1))
 		}
-		return nil, errs.NewJWTError(op, errs.CodeJWTMalformed, err)
+		b, err := segmentEncoding.DecodeString(segment)
+		if err != nil {
+			return nil, malformed(fmt.Errorf("segment %d: %w", i+1, err))
+		}
+		decoded[i] = b
 	}
-	if _, ok := tok.Header["crit"]; ok {
-		return nil, errs.NewJWTError(op, errs.CodeJWTMalformed, errors.New("the header names critical extensions"))
+
+	var header map[string]any
+	if err := json.Unmarshal(decoded[0], &header); err != nil || header == nil {
+		return nil, malformed(fmt.Errorf("the header is not a JSON object: %v", err))
 	}
-	signature, err := p.DecodeSegment(parts[2])
-	if err != nil {
-		return nil, errs.NewJWTError(op, errs.CodeJWTMalformed, err)
+	if _, ok := header["crit"]; ok {
+		return nil, malformed(errors.New("the header names critical extensions"))
 	}
-	payload, err := p.DecodeSegment(parts[1])
-	if err != nil {
-		return nil, errs.NewJWTError(op, errs.CodeJWTMalformed, err)
+	alg, ok := header["alg"].(string)
+	if !ok {
+		return nil, malformed(errors.New("the header's alg is missing or not a string"))
 	}
-	alg, _ := tok.Header["alg"].(string)
-	kid, _ := tok.Header["kid"].(string)
-	return &parsed{alg: alg, kid: kid, signingString: parts[0] + "." + parts[1], signature: signature, payload: payload}, nil
+	var kid string
+	if value, present := header["kid"]; present {
+		if kid, ok = value.(string); !ok {
+			return nil, malformed(errors.New("the header's kid is not a string"))
+		}
+	}
+	return &parsed{alg: alg, kid: kid, signingString: segments[0] + "." + segments[1], signature: decoded[2], payload: decoded[1]}, nil
+}
+
+// decodeClaims decodes the payload of a token whose signature is checked
+// into claims. A payload that is not a JSON object is refused with
+// malformed_token: the token is a JWS, but not a JWT (RFC 7519, section
+// 7.2).
+func (p *parsed) decodeClaims(op string, claims any) error {
+	if object := bytes.TrimLeft(p.payload, " \t\r\n"); len(object) == 0 || object[0] != '{' {
+		return errs.NewJWTError(op, errs.CodeJWTMalformed, errors.New("the claims are not a JSON object"))
+	}
+	if err := json.Unmarshal(p.payload, claims); err != nil {
+		return errs.NewJWTError(op, errs.CodeJWTMalformed, err)
+	}
+	return nil
 }
 
 // signWith encodes claims with a header naming alg and kid, and signs it
@@ -217,26 +291,35 @@ func (j *internalJWT) sign(req JWTRequest) (string, error) {
 
 func (j *internalJWT) verify(token string) (*Claims, error) {
 	const op = "JWT.Verify.Internal"
-	var c wireClaims
-	p, err := parse(op, token, &c)
+	p, err := parse(op, token)
 	if err != nil {
 		return nil, err
 	}
 	if p.alg != jwt.SigningMethodHS256.Alg() {
 		return nil, errs.NewJWTError(op, errs.CodeJWTAlgorithmMismatch, nil)
 	}
+	// The kid is the version as sign writes it. Another form of a number,
+	// such as "01" or "+1", names no key.
 	version, err := strconv.Atoi(p.kid)
-	if err != nil {
-		return nil, errs.NewJWTError(op, errs.CodeJWTMalformed, err)
+	if err != nil || strconv.Itoa(version) != p.kid {
+		return nil, errs.NewJWTError(op, errs.CodeJWTUnknownKey, err)
 	}
 	// The signer checks the HMAC in constant time, with the key of the
-	// token's version.
+	// token's version. A version the key manager does not hold is the
+	// token's, and refuses it: the system has not failed.
 	ok, err := j.signer.Verify([]byte(p.signingString), p.signature, version)
+	if errs.IsCode(err, errs.CodeUnknownKeyVersion) {
+		return nil, errs.NewJWTError(op, errs.CodeJWTUnknownKey, err)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, errs.NewJWTError(op, errs.CodeJWTInvalidSignature, nil)
+	}
+	var c wireClaims
+	if err := p.decodeClaims(op, &c); err != nil {
+		return nil, err
 	}
 	return validate(op, &c, j.cfg.Issuer, j.cfg.Audiences[JWTInternal])
 }

@@ -33,9 +33,11 @@ userID := verified.Subject
 
 `VerifyJWT` accepts a token only when every one of these checks passes:
 
+- **The size.** The token is at most 64 KiB, and its header at most 8 KiB. A longer one is refused before any of it is decoded.
+- **The encoding.** The token is three segments of base64url without padding, in their one encoding: a line break, a space, or a last character with its unused bits set is refused. A token can't be changed into another string that verifies.
 - **The algorithm.** The header's `alg` is one of `VerifyOptions.Algorithms`, and the key's own algorithm. For a key that names none, such as an RSA key without `alg`, it is one the key's type signs with. `none` and the HMAC algorithms are always refused.
-- **The key.** The header's `kid` names a key of the set. A token without a `kid` is refused, unless `AllowMissingKID` is set.
-- **The signature.** It is checked before any claim.
+- **The key.** The header's `kid` names a key of the set. A token without a `kid` is refused, unless `AllowMissingKID` is set. A key the header carries itself (`jwk`, `jku`, `x5u`, `x5c`) is never used.
+- **The signature.** It is checked before the claims are decoded.
 - **The time.** `exp` is required and has not passed. `nbf`, when present, has passed. `iat` is checked with `CheckIssuedAt`.
 - **The issuer and the audience.** `iss` is one of `Issuers`, and `aud` holds one of `Audiences`.
 
@@ -46,12 +48,12 @@ userID := verified.Subject
 | `Issuers` | required | The values `iss` may have. |
 | `Audiences` | required | Your service's names. `aud` has to hold one of them, so a token issued for another service is refused. |
 | `Algorithms` | every asymmetric algorithm | The algorithms a token may be signed with: `EdDSA`, `ES256`, `ES384`, `ES512`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`. |
-| `Leeway` | none | The clock skew allowed on `exp`, `nbf`, and `iat`. |
+| `Leeway` | none | The clock skew allowed on `exp`, `nbf`, and `iat`. At most five minutes. |
 | `CheckIssuedAt` | `false` | Refuses a token whose `iat` is later than now, plus `Leeway`. |
 | `AllowMissingKID` | `false` | Checks a token without a `kid` against every key of the set that fits its algorithm. |
 | `Now` | `time.Now` | The clock, for tests. |
 
-Options without an issuer or an audience, a symmetric algorithm in `Algorithms`, and a negative `Leeway` are a configuration error.
+Options without an issuer or an audience, a symmetric algorithm in `Algorithms`, and a `Leeway` that is negative or over five minutes are a configuration error. Servers whose clocks NTP keeps are within a second of each other: a longer leeway only lets a token be used for that much longer after it expires.
 
 ## Read the claims
 
@@ -98,7 +100,8 @@ Check with `errs.IsCategory(err, errs.CategoryToken)`. The codes of a refused to
 
 | Code | The token |
 | --- | --- |
-| `malformed_token` | is not a JWT, has a segment that can't be decoded, or has a `crit` header |
+| `token_too_large` | is longer than 64 KiB, or has a header longer than 8 KiB |
+| `malformed_token` | is not three segments of base64url in their one encoding, has a header without an `alg`, a `kid` that is not a string, or a `crit` member, or has claims that are not a JSON object |
 | `algorithm_mismatch` | names an algorithm that is not allowed, or that its key does not sign with |
 | `unknown_signing_key` | names a `kid` the set lacks, even after a fetch, or names none |
 | `invalid_signature` | has a signature that does not match |

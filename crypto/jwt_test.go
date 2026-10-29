@@ -475,7 +475,7 @@ func TestJWTKeyRotation(t *testing.T) {
 		retired := newJWTFixture(t, map[int]string{2: secretV2}, 2)
 		var verifyErr error
 		require.NotPanics(t, func() { _, verifyErr = retired.provider.Verify(ctx, crypto.JWTInternal, old) })
-		assert.Error(t, verifyErr, "a version that was removed no longer verifies")
+		refusedWith(t, verifyErr, errs.CodeJWTUnknownKey, "a version that was removed no longer verifies, and is a refused token")
 		_, err = retired.provider.Verify(ctx, crypto.JWTInternal, fresh)
 		assert.NoError(t, err)
 	})
