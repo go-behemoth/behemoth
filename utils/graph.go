@@ -87,53 +87,52 @@ func mergeSorted(a, b []string, less func(a, b string) bool) []string {
 	return append(append(out, a[i:]...), b[j:]...)
 }
 
-// findCyclePath walks from any node that still has unresolved in-degree
-// (proof it's part of, or downstream of, a cycle) following one dependency
-// edge at a time until a node repeats, which marks the actual cycle,
-// trimmed out of the full walk for a concise, readable report.
+// findCyclePath returns one cycle among the nodes KahnSort could not order,
+// those whose in-degree stayed above zero, as a path from a node through its
+// dependencies back to itself. Each such node waits for a dependency that is
+// unordered too, so a walk that follows only those dependencies never ends,
+// and the first node it reaches twice closes a cycle. Following a dependency
+// that was ordered would end the walk at a node that is in no cycle. The walk
+// starts at the first unordered node by name and takes the first dependency
+// by name, so a graph always gets the same report.
 func findCyclePath(graph map[string][]string, remainingInDegree map[string]int) []string {
-	// Build the reverse (dependency-direction) map once, for walking;
-	// since the graph i sin dependant-direction
+	// The graph lists the dependants of each node, and the walk goes the
+	// other way.
 	dependsOn := make(map[string][]string)
 	for node, dependants := range graph {
+		if remainingInDegree[node] == 0 {
+			continue
+		}
 		for _, d := range dependants {
 			dependsOn[d] = append(dependsOn[d], node)
 		}
 	}
 
-	var start string
+	var unordered []string
 	for n, deg := range remainingInDegree {
 		if deg > 0 {
-			start = n
-			break
+			unordered = append(unordered, n)
 		}
 	}
-
-	if start == "" {
-		return nil // defensive: shouldn't happen if the caller already confirmed a cycle exists
+	if len(unordered) == 0 {
+		return nil // KahnSort calls it only when a node was left unordered
 	}
+	sort.Strings(unordered)
 
-	visited := map[string]bool{}
+	start := unordered[0]
+	at := map[string]int{start: 0} // each node of the path, and its index
 	path := []string{start}
-	current := start
-	for {
+	for current := start; ; {
 		next := dependsOn[current]
 		if len(next) == 0 {
-			return path // dead end without a repeat. shouldn't occur in a genuine cycle
+			return path // an unordered node always has an unordered dependency
 		}
-		sort.Strings(next) // deterministic even when a node has multiple unresolved dependencies
+		sort.Strings(next)
 		current = next[0]
-		if visited[current] {
-			path = append(path, current)
-			// Trim everything before the repeat's first occurrence,
-			// so the reported path is exactly the cycle.
-			for i, n := range path {
-				if n == current {
-					return path[i:]
-				}
-			}
+		if i, seen := at[current]; seen {
+			return append(path[i:], current)
 		}
-		visited[current] = true
+		at[current] = len(path)
 		path = append(path, current)
 	}
 }

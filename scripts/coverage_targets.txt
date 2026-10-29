@@ -1,0 +1,70 @@
+# Coverage targets of the published packages, read by scripts/coverage.sh.
+#
+# Each line names a package directory, relative to the repository's root, and
+# the share of its statements, in percent, that the tests of the whole
+# repository must run. CI fails when a package is below its target, when a
+# package has no line here, and when a line names a package that has no
+# statements. Raise a target when the tests of its package improve, and don't
+# lower one to make a change pass: add the tests instead.
+#
+# Packages that decide who is signed in, or that hold keys and secrets, have
+# 90%: the cryptography, the key sources, the session and token managers,
+# the HTTP side, the caller, the outbound client, the plugins and the router
+# adapters. Every other package has 80%.
+
+# --- 90% ------------------------------------------------------------------------
+
+auth                            90
+crypto                          90
+httpapi                         90
+identity                        90
+keysource                       90
+outbound                        90
+plugins/adapters/chi            90
+plugins/adapters/echo           90
+plugins/adapters/fiber          90
+plugins/adapters/gin            90
+plugins/adapters/nethttp        90
+plugins/emailpassword           90
+plugins/emailverification       90
+plugins/magiclink               90
+plugins/oauth                   90
+plugins/phonenumber             90
+plugins/twofactor               90
+plugins/twofactor/totp          90
+plugins/username                90
+
+# --- 80% ------------------------------------------------------------------------
+
+.                               80
+cli                             80
+cmd/behemoth                    80
+core                            80
+dispatch                        80
+engine                          80
+errs                            80
+messaging                       80
+migration                       80
+models                          80
+ratelimit                       80
+schema                          80
+storage/adapters                80
+storage/adapters/bun            80
+storage/adapters/gorm           80
+storage/adapters/mongo          80
+storage/adapters/mysql          80
+storage/adapters/postgres       80
+storage/adapters/redis          80
+storage/adapters/sqlite         80
+storage/adapters/sqlserver      80
+store                           80
+telemetry                       80
+telemetry/adapters/otel         80
+telemetry/telemetrytest         80
+utils                           80
+
+# --- No target ------------------------------------------------------------------
+
+# Nothing imports storage: it holds unused helpers left from an earlier
+# layout, and is to be deleted. Remove its line with it.
+storage                         0

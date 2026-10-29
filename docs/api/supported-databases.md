@@ -39,15 +39,15 @@ To start without them, set `BootConfig.AllowUnenforcedForeignKeys`. `Boot` then 
 
 ## Run the tests against another release
 
-The container suites in `tests/` start the minimum release of each database. Set an environment variable to start another release:
+The container suites in `tests/` start the minimum release of each database. Set an environment variable to start another release. These are the newest releases:
 
 ```bash
 BEHEMOTH_TEST_POSTGRES_IMAGE=postgres:18 \
 BEHEMOTH_TEST_MYSQL_IMAGE=mysql:9 \
-BEHEMOTH_TEST_MONGO_IMAGE=mongo:7.0 \
-BEHEMOTH_TEST_MSSQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest \
+BEHEMOTH_TEST_MONGO_IMAGE=mongo:8 \
+BEHEMOTH_TEST_MSSQL_IMAGE=mcr.microsoft.com/mssql/server:2025-latest \
 BEHEMOTH_TEST_REDIS_IMAGE=redis:8-alpine \
   go test ./storage/... ./store/...
 ```
 
-Each variable takes a container image name and tag. A variable you leave out keeps the minimum release.
+Each variable takes a container image name and tag. A variable you leave out keeps the minimum release. MongoDB 8 does not start on Linux 6.19 and later ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)).

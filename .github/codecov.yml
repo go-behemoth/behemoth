@@ -1,0 +1,19 @@
+# Codecov keeps the coverage that CI uploads on each push to dev and main, and
+# shows it behind the badge in the README. The coverage job of
+# .github/workflows/go.yml checks coverage against scripts/coverage_targets.txt
+# itself, so Codecov comments on no pull request and sets no status.
+
+comment: false
+
+coverage:
+  status:
+    project: off
+    patch: off
+
+github_checks:
+  annotations: false
+
+# The profile names files by import path. A file's path in the repository is
+# what follows the module path.
+fixes:
+  - "github.com/go-behemoth/behemoth/::"

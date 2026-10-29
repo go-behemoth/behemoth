@@ -349,7 +349,7 @@ The plugin is built in this order. Each step ends with its tests and its docs.
 These entries in `docs/ongoing.md` affect the design:
 
 - **"No route can accept a form body under the cookie deliveries".** The entry names an OAuth callback as a route that needs the exemption. With the callback on a page of the application, the plugin has no such route. A provider's form post goes to the application.
-- **"Nothing removes old sessions, tokens, or rate-limit counters".** Every `Begin` writes a state row, and nothing purges them. The key-value backend suits the `oauth_state` kind, because an entry there expires by itself.
+- **"Nothing removes old sessions, tokens, or rate-limit counters".** Every `Begin` writes a state row, and `Store.Purge` now removes the expired ones. The key-value backend would suit the `oauth_state` kind, because an entry there expires by itself, but it holds no single-use kind: the key-value storage can't consume a token exactly once (`docs/ongoing.md`, L69).
 
 ## Integration with goth
 

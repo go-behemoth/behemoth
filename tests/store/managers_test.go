@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1389,7 +1390,7 @@ func TestTokenListForSubject(t *testing.T) {
 	for _, def := range []core.TokenKindDef{
 		{Kind: kindReset, SingleUse: true, DefaultTTL: time.Hour, Backend: core.TokenBackendDB, Owner: "core"},
 		{Kind: kindShort, SingleUse: true, DefaultTTL: time.Millisecond, Backend: core.TokenBackendDB, Owner: "core"},
-		{Kind: "in_kv", SingleUse: true, DefaultTTL: time.Hour, Backend: core.TokenBackendKV, Owner: "core"},
+		{Kind: "in_kv", DefaultTTL: time.Hour, Backend: core.TokenBackendKV, Owner: "core"},
 	} {
 		require.NoError(t, catalog.Declare(def))
 	}
@@ -1428,6 +1429,387 @@ func TestTokenListForSubject(t *testing.T) {
 	assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "a kind in the key-value storage can't be listed: %v", err)
 	_, err = tm.ListForSubject(ctx, "undeclared", "u1")
 	assert.Error(t, err)
+}
+
+// A multi-use kind can live in the key-value storage: an entry per token,
+// under its lookup hash, that expires with the token. Listing and revoking by
+// subject need the tokens table.
+func TestTokenInTheKeyValueStorage(t *testing.T) {
+	ctx := context.Background()
+	kv := &memoryKV{}
+	catalog := auth.NewDefaultTokenCatalog()
+	require.NoError(t, catalog.Declare(core.TokenKindDef{Kind: "invite", DefaultTTL: time.Hour, Backend: core.TokenBackendKV, Owner: "core"}))
+	cfg := core.TokenConfig{TTLOverrides: map[models.TokenKind]time.Duration{"invite": 2 * time.Hour}}
+	tm := auth.NewDefaultTokenManager(store.New(sessionsTokensDB(t)), kv, catalog, testCrypto(t), &passDispatcher{}, cfg, managersAuth)
+
+	tok, raw, err := tm.Issue(ctx, "invite", "u1", behemoth.M{"team": "t1"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, tok.ID)
+	key := "token:invite:" + tok.LookupHash
+	assert.Equal(t, 2*time.Hour, kv.ttls[key], "the entry lives as long as the token, overridden in the config")
+
+	for range 2 {
+		verified, err := tm.Verify(ctx, "invite", raw)
+		require.NoError(t, err, "a multi-use token verifies every time")
+		assert.Equal(t, tok.ID, verified.ID)
+		assert.Equal(t, behemoth.M{"team": "t1"}, verified.MetadataJSON)
+	}
+	_, err = tm.Consume(ctx, "invite", raw)
+	assert.True(t, errs.IsCode(err, errs.CodeTokenInvalidUsage), "%v", err)
+	err = tm.RevokeAllForSubject(ctx, "invite", "u1")
+	assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%v", err)
+
+	// A missing entry, another token's entry under this token's key, and an
+	// entry that does not decode all read as no token.
+	_, err = tm.Verify(ctx, "invite", "not-a-token")
+	assert.True(t, errs.IsCode(err, errs.CodeTokenNotFound), "%v", err)
+	other, _, err := tm.Issue(ctx, "invite", "u2", nil)
+	require.NoError(t, err)
+	forged, err := kv.Get(ctx, "token:invite:"+other.LookupHash)
+	require.NoError(t, err)
+	require.NoError(t, kv.Set(ctx, key, forged, 3600))
+	_, err = tm.Verify(ctx, "invite", raw)
+	assert.True(t, errs.IsCode(err, errs.CodeTokenNotFound), "the lookup hash matches and the keyed hash doesn't: %v", err)
+	require.NoError(t, kv.Set(ctx, key, "{not json", 3600))
+	_, err = tm.Verify(ctx, "invite", raw)
+	assert.True(t, errs.IsCode(err, errs.CodeTokenNotFound), "%v", err)
+}
+
+// A kind in the key-value storage is refused a token when there is no
+// storage, or when its tokens would never expire there.
+func TestTokenInTheKeyValueStorageNeedsAStorageAndAnExpiry(t *testing.T) {
+	ctx := context.Background()
+	catalog := auth.NewDefaultTokenCatalog()
+	require.NoError(t, catalog.Declare(core.TokenKindDef{Kind: "invite", DefaultTTL: time.Hour, Backend: core.TokenBackendKV, Owner: "core"}))
+	require.NoError(t, catalog.Declare(core.TokenKindDef{Kind: "forever", Backend: core.TokenBackendKV, Owner: "core"}))
+	st := store.New(sessionsTokensDB(t))
+
+	withoutKV := auth.NewDefaultTokenManager(st, nil, catalog, testCrypto(t), &passDispatcher{}, core.TokenConfig{}, managersAuth)
+	_, _, err := withoutKV.Issue(ctx, "invite", "u1", nil)
+	assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%v", err)
+
+	kv := &memoryKV{}
+	tm := auth.NewDefaultTokenManager(st, kv, catalog, testCrypto(t), &passDispatcher{}, core.TokenConfig{}, managersAuth)
+	_, _, err = tm.Issue(ctx, "forever", "u1", nil)
+	assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%v", err)
+	assert.Empty(t, kv.entries)
+}
+
+// A single-use kind needs the database, which consumes a token exactly once:
+// the key-value storage has no operation that reads and deletes an entry in
+// one step. DefaultTokenCatalog refuses such a kind, and Consume refuses one
+// from any other catalog, every time, so the token is never reported
+// consumed while it stays usable.
+func TestTokenConsumeNeedsTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	def := core.TokenKindDef{Kind: "in_kv", SingleUse: true, DefaultTTL: time.Hour, Backend: core.TokenBackendKV, Owner: "core"}
+	tm := auth.NewDefaultTokenManager(store.New(sessionsTokensDB(t)), &memoryKV{}, lenientCatalog{def.Kind: def},
+		testCrypto(t), &passDispatcher{}, core.TokenConfig{}, managersAuth)
+
+	_, raw, err := tm.Issue(ctx, def.Kind, "u1", nil)
+	require.NoError(t, err)
+	for range 2 {
+		_, err := tm.Consume(ctx, def.Kind, raw)
+		assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "%v", err)
+	}
+}
+
+// lenientCatalog is a TokenCatalog that takes any kind.
+type lenientCatalog map[models.TokenKind]core.TokenKindDef
+
+func (c lenientCatalog) Declare(def core.TokenKindDef) error { c[def.Kind] = def; return nil }
+
+func (c lenientCatalog) Lookup(kind models.TokenKind) (core.TokenKindDef, bool) {
+	def, ok := c[kind]
+	return def, ok
+}
+
+// The token manager names an undeclared kind, and passes on what fails under
+// it: a hook handler that refuses, and a database it can't reach.
+func TestTokenManagerReportsFailures(t *testing.T) {
+	ctx := context.Background()
+	refused := errors.New("refused")
+
+	t.Run("undeclared kind", func(t *testing.T) {
+		tm, _ := newTokenManager(t)
+		_, _, err := tm.Issue(ctx, "undeclared", "u1", nil)
+		assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "Issue: %v", err)
+		_, err = tm.Verify(ctx, "undeclared", "raw")
+		assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "Verify: %v", err)
+		_, err = tm.Consume(ctx, "undeclared", "raw")
+		assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "Consume: %v", err)
+		err = tm.RevokeAllForSubject(ctx, "undeclared", "u1")
+		assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "RevokeAllForSubject: %v", err)
+	})
+
+	t.Run("hook handlers", func(t *testing.T) {
+		for _, point := range []core.HookPoint{hooks.HookTokenBeforeIssue, hooks.HookTokenAfterIssue} {
+			tm := tokenManagerWith(t, store.New(sessionsTokensDB(t)), &failingDispatcher{point: point, err: refused})
+			_, _, err := tm.Issue(ctx, kindReset, "u1", nil)
+			assert.ErrorIs(t, err, refused, point)
+		}
+
+		tm := tokenManagerWith(t, store.New(sessionsTokensDB(t)), &failingDispatcher{point: hooks.HookTokenConsumed, err: refused})
+		_, raw, err := tm.Issue(ctx, kindReset, "u1", nil)
+		require.NoError(t, err)
+		_, err = tm.Consume(ctx, kindReset, raw)
+		assert.ErrorIs(t, err, refused)
+
+		tm = tokenManagerWith(t, store.New(sessionsTokensDB(t)), &failingDispatcher{point: hooks.HookTokenFailed, err: refused})
+		_, err = tm.Consume(ctx, kindReset, "not-a-token")
+		assert.ErrorIs(t, err, refused, "the failed point's error takes the place of the token's")
+	})
+
+	t.Run("unreachable database", func(t *testing.T) {
+		tm := tokenManagerWith(t, unreachableStore(t), &passDispatcher{})
+		_, _, err := tm.Issue(ctx, kindReset, "u1", nil)
+		assert.Error(t, err, "Issue")
+		assert.Error(t, tm.Revoke(ctx, "t1"), "Revoke")
+		assert.Error(t, tm.RevokeAllForSubject(ctx, kindReset, "u1"), "RevokeAllForSubject")
+		_, err = tm.ListForSubject(ctx, kindReset, "u1")
+		assert.Error(t, err, "ListForSubject")
+	})
+}
+
+// tokenManagerWith builds a token manager like newTokenManager does, over st
+// and with d.
+func tokenManagerWith(t *testing.T, st *store.Store, d core.Dispatcher) core.TokenManager {
+	t.Helper()
+	catalog := auth.NewDefaultTokenCatalog()
+	require.NoError(t, catalog.Declare(core.TokenKindDef{Kind: kindReset, SingleUse: true, DefaultTTL: time.Hour, Backend: core.TokenBackendDB, Owner: "core"}))
+	return auth.NewDefaultTokenManager(st, nil, catalog, testCrypto(t), d, core.TokenConfig{}, managersAuth)
+}
+
+// failingDispatcher is a passDispatcher that returns err at one hook point.
+type failingDispatcher struct {
+	passDispatcher
+	point core.HookPoint
+	err   error
+}
+
+func (d *failingDispatcher) RunBefore(h *core.HookContext, point core.HookPoint, p behemoth.M) (behemoth.M, error) {
+	if point == d.point {
+		return nil, d.err
+	}
+	return d.passDispatcher.RunBefore(h, point, p)
+}
+
+func (d *failingDispatcher) RunAfter(h *core.HookContext, point core.HookPoint, v any) error {
+	if point == d.point {
+		return d.err
+	}
+	return d.passDispatcher.RunAfter(h, point, v)
+}
+
+func (d *failingDispatcher) RunAfterTx(h *core.HookContext, point core.HookPoint, v any) error {
+	if point == d.point {
+		return d.err
+	}
+	return d.passDispatcher.RunAfterTx(h, point, v)
+}
+
+func (d *failingDispatcher) Fail(h *core.HookContext, point core.HookPoint, r core.FailureReason) error {
+	if point == d.point {
+		return d.err
+	}
+	return d.passDispatcher.Fail(h, point, r)
+}
+
+// unreachableStore is a store over a closed database: every call to it
+// fails.
+func unreachableStore(t *testing.T) *store.Store {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "closed.db"))
+	require.NoError(t, err)
+	_, err = db.Exec(sessionsTokensSQLite)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	return store.New(sqliteAdapter.NewSQLiteAdapter(db, nil))
+}
+
+// cryptoWith builds crypto services over secrets, by version, that hash
+// under current.
+func cryptoWith(t *testing.T, secrets map[int]string, current int) crypto.Services {
+	t.Helper()
+	c, err := crypto.New(context.Background(), crypto.Config{
+		Secrets: crypto.StaticSecretSource{Secrets: secrets, Current: current},
+	}, nil)
+	require.NoError(t, err)
+	return c
+}
+
+// A session hashed under a secret that has since been replaced is hashed
+// again under the current one when it is next used, so that the old secret
+// can be retired. Before that, a manager without the old secret refuses the
+// session. Another secret under the same version matches nothing.
+func TestSessionMovesToTheCurrentSecretOnUse(t *testing.T) {
+	ctx := context.Background()
+	old, current := strings.Repeat("cd", 32), strings.Repeat("ef", 32)
+	st := store.New(sessionsTokensDB(t))
+	manager := func(secrets map[int]string, version int) core.SessionManager {
+		return auth.NewSessionManager(st, nil, cryptoWith(t, secrets, version), core.SessionConfig{ExpiresIn: time.Hour},
+			&passDispatcher{}, nil, managersAuth)
+	}
+
+	sess, raw, err := manager(map[int]string{1: old}, 1).Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+	retired := manager(map[int]string{2: current}, 2)
+	_, err = retired.Get(ctx, raw)
+	assert.Error(t, err, "the secret the session was hashed under is gone")
+
+	got, err := manager(map[int]string{1: old, 2: current}, 2).Get(ctx, raw)
+	require.NoError(t, err)
+	assert.Equal(t, 2, got.KeyVersion)
+	stored, err := st.FindSessionByID(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, stored.KeyVersion, "the new hash is written")
+	_, err = retired.Get(ctx, raw)
+	assert.NoError(t, err, "the old secret can go")
+
+	_, err = manager(map[int]string{2: strings.Repeat("01", 32)}, 2).Get(ctx, raw)
+	assert.True(t, errs.IsNotFound(err), "another secret under version 2: %v", err)
+}
+
+// Only a pending session that has not expired can be promoted: a revoked one
+// never comes back, and an abandoned one starts again from the sign-in.
+func TestSessionPromoteNeedsALivePendingSession(t *testing.T) {
+	ctx := context.Background()
+	now := t0
+	st := store.New(sessionsTokensDB(t), store.WithClock(func() time.Time { return now }))
+	sm := auth.NewSessionManager(st, nil, testCrypto(t), core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: 5 * time.Minute},
+		&passDispatcher{}, nil, managersAuth)
+	pending := core.SessionMeta{State: models.SessionPending}
+
+	revoked, _, err := sm.Create(ctx, "u1", pending)
+	require.NoError(t, err)
+	require.NoError(t, sm.Revoke(ctx, revoked.ID, "test"))
+	_, _, err = sm.Promote(ctx, revoked.ID, "totp")
+	assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "%v", err)
+
+	abandoned, _, err := sm.Create(ctx, "u1", pending)
+	require.NoError(t, err)
+	now = now.Add(10 * time.Minute)
+	_, _, err = sm.Promote(ctx, abandoned.ID, "totp")
+	assert.True(t, errs.IsCode(err, errs.CodeSessionExpired), "%v", err)
+}
+
+// Of two revokes of one session, the one whose write comes second finds the
+// session revoked. It returns without an error, and the handlers of
+// auth.session.afterRevoke hear of the revoke once, with the first reason.
+func TestSessionRevokeLosesToAConcurrentRevoke(t *testing.T) {
+	ctx := context.Background()
+	d := &interceptDispatcher{}
+	st := store.New(sessionsTokensDB(t))
+	sm := auth.NewSessionManager(st, nil, testCrypto(t), core.SessionConfig{ExpiresIn: time.Hour}, d, nil, managersAuth)
+	sess, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+	require.NoError(t, err)
+
+	d.once = map[core.HookPoint]func(){hooks.HookSessionBeforeRevoke: func() {
+		require.NoError(t, sm.Revoke(ctx, sess.ID, "first"))
+	}}
+	require.NoError(t, sm.Revoke(ctx, sess.ID, "second"))
+	assert.Equal(t, 1, d.fired(hooks.HookSessionAfterRevoke))
+	stored, err := st.FindSessionByID(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "first", stored.RevokedReason)
+}
+
+// The session manager refuses a state a session can't start in, and passes
+// on what fails under it: a hook handler that refuses, and a database it
+// can't reach.
+func TestSessionManagerReportsFailures(t *testing.T) {
+	ctx := context.Background()
+	refused := errors.New("refused")
+	active := core.SessionMeta{State: models.SessionActive}
+	cfg := core.SessionConfig{ExpiresIn: time.Hour, PendingExpiresIn: time.Minute}
+	newManager := func(st *store.Store, d core.Dispatcher, cfg core.SessionConfig) core.SessionManager {
+		return auth.NewSessionManager(st, nil, testCrypto(t), cfg, d, nil, managersAuth)
+	}
+
+	t.Run("a state to start in", func(t *testing.T) {
+		sm := newManager(store.New(sessionsTokensDB(t)), &passDispatcher{}, cfg)
+		_, _, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionRevoked})
+		assert.True(t, errs.IsCategory(err, errs.CategoryValidation), "%v", err)
+	})
+
+	t.Run("hook handlers", func(t *testing.T) {
+		sm := newManager(store.New(sessionsTokensDB(t)), &failingDispatcher{point: hooks.HookSessionAfterCreate, err: refused}, cfg)
+		_, _, err := sm.Create(ctx, "u1", active)
+		assert.ErrorIs(t, err, refused, "afterCreate")
+
+		st := store.New(sessionsTokensDB(t))
+		sm = newManager(st, &failingDispatcher{point: hooks.HookSessionBeforeRevoke, err: refused}, cfg)
+		sess, _, err := sm.Create(ctx, "u1", active)
+		require.NoError(t, err)
+		assert.ErrorIs(t, sm.Revoke(ctx, sess.ID, "test"), refused, "Revoke")
+		assert.ErrorIs(t, sm.RevokeAllForUser(ctx, "u1", "test", ""), refused, "RevokeAllForUser")
+		stored, err := st.FindSessionByID(ctx, sess.ID)
+		require.NoError(t, err)
+		assert.Equal(t, models.SessionActive, stored.State, "a refused revoke leaves the session")
+
+		sm = newManager(st, &failingDispatcher{point: hooks.HookSessionAfterRevoke, err: refused}, cfg)
+		assert.ErrorIs(t, sm.Discard(ctx, []*models.Session{stored}, "user_deleted"), refused, "Discard")
+	})
+
+	t.Run("unreachable database", func(t *testing.T) {
+		st := unreachableStore(t)
+		sm := newManager(st, &passDispatcher{}, cfg)
+		_, _, err := sm.Create(ctx, "u1", active)
+		assert.Error(t, err, "Create")
+		limited := cfg
+		limited.MaxConcurrent = 1
+		_, _, err = newManager(st, &passDispatcher{}, limited).Create(ctx, "u1", active)
+		assert.Error(t, err, "Create, counting the user's sessions")
+		_, _, err = sm.Promote(ctx, "s1", "totp")
+		assert.Error(t, err, "Promote")
+		assert.Error(t, sm.Revoke(ctx, "s1", "test"), "Revoke")
+		assert.Error(t, sm.RevokeAllForUser(ctx, "u1", "test", ""), "RevokeAllForUser")
+		_, err = sm.ListForUser(ctx, "u1")
+		assert.Error(t, err, "ListForUser")
+		rolling := cfg
+		rolling.UpdateAge = time.Hour
+		_, err = newManager(st, &passDispatcher{}, rolling).Touch(ctx, &models.Session{ID: "s1", ExpiresAt: time.Now()})
+		assert.Error(t, err, "Touch")
+	})
+}
+
+// A session cache that fails costs only speed: each operation still
+// succeeds against the database, and each failed write is logged.
+func TestSessionCacheFailuresAreLogged(t *testing.T) {
+	ctx := context.Background()
+	for name, kv := range map[string]behemoth.KeyValueStorage{
+		"versioned": brokenKV{},
+		"plain":     plainKV{brokenKV{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tel, rec := telemetrytest.New()
+			sm := auth.NewSessionManager(store.New(sessionsTokensDB(t)), kv, testCrypto(t), core.SessionConfig{ExpiresIn: time.Hour},
+				&passDispatcher{}, tel, managersAuth)
+			sess, raw, err := sm.Create(ctx, "u1", core.SessionMeta{State: models.SessionActive})
+			require.NoError(t, err)
+			_, err = sm.Get(ctx, raw)
+			require.NoError(t, err)
+			require.NoError(t, sm.Revoke(ctx, sess.ID, "test"))
+			_, err = sm.Get(ctx, raw)
+			assert.True(t, errs.IsCode(err, errs.CodeSessionRevoked), "the database decides: %v", err)
+			assert.NotEmpty(t, rec.Logger.At(slog.LevelWarn))
+		})
+	}
+}
+
+// brokenKV is a session cache whose every call fails.
+type brokenKV struct{}
+
+var errUnreachable = errors.New("unreachable")
+
+func (brokenKV) Get(context.Context, string) (string, error)    { return "", errUnreachable }
+func (brokenKV) Set(context.Context, string, string, int) error { return errUnreachable }
+func (brokenKV) Delete(context.Context, string) error           { return errUnreachable }
+func (brokenKV) SetIfNewer(context.Context, string, string, int64, time.Duration) (bool, error) {
+	return false, errUnreachable
+}
+func (brokenKV) GetVersioned(context.Context, string) (string, int64, error) {
+	return "", 0, errUnreachable
 }
 
 // A session is fresh for FreshAge after it was created or promoted.

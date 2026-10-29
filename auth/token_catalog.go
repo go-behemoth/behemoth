@@ -34,6 +34,9 @@ func (c *DefaultTokenCatalog) Declare(def core.TokenKindDef) error {
 	if def.Backend != core.TokenBackendDB && def.Backend != core.TokenBackendKV {
 		return errs.NewConfigurationError("TokenCatalog.Declare", fmt.Sprintf("kind %q declared with invalid Backend %q", def.Kind, def.Backend), nil)
 	}
+	if def.SingleUse && def.Backend == core.TokenBackendKV {
+		return errs.NewConfigurationError("TokenCatalog.Declare", fmt.Sprintf("kind %q is single-use and needs TokenBackendDB: the key-value storage can't consume a token exactly once", def.Kind), nil)
+	}
 	if existing, dup := c.kinds[def.Kind]; dup {
 		return errs.NewConfigurationError("TokenCatalog.Declare", fmt.Sprintf("kind %q already declared by %q", def.Kind, existing.Owner), nil)
 	}

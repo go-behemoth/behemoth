@@ -310,49 +310,34 @@ func (tm *DefaultTokenManager) consume(ctx context.Context, kind models.TokenKin
 		// disable it on first use
 		return nil, errs.NewTokenError(op, errs.CodeTokenInvalidUsage, nil)
 	}
-
-	var result *models.Token
-	var consumeErr error
-
-	switch def.Backend {
-	case core.TokenBackendDB:
-		// Fetch, validate and consume in one transaction. ConsumeToken is
-		// what makes it at-most-once: a concurrent Consume that read the
-		// token before this one stamped it still loses.
-		consumeErr = tm.st.Transaction(ctx, func(ctx context.Context, tx *store.Store) error {
-			tok, err := tm.fetch(ctx, tx, def, kind, rawToken)
-			if err != nil {
-				return err // already fully classified inside fetch
-			}
-			if err := checkConsumable(tok, tx.Now()); err != nil {
-				return err
-			}
-			at, err := tx.ConsumeToken(ctx, tok.ID)
-			if err != nil {
-				return err
-			}
-			tok.ConsumedAt = &at
-			result = tok
-			return nil
-		})
-	case core.TokenBackendKV:
-		// KeyValueStorage exposes no transaction primitive, so this is
-		// non-atomic Get-then-Delete. Two concurrent Consume calls for the
-		// same token can both pass Get before either Delete runs, and both
-		// would appear to succeed.
-		tok, err := tm.fetch(ctx, tm.st, def, kind, rawToken)
-		if err != nil {
-			consumeErr = err // already fully classified inside fetch
-			break
-		}
-		now := tm.st.Now()
-		if err := checkConsumable(tok, now); err != nil {
-			consumeErr = err
-			break
-		}
-		tok.ConsumedAt = &now
-		result = tok
+	if def.Backend != core.TokenBackendDB {
+		// Only the database consumes a token at most once: KeyValueStorage
+		// has no operation that reads and deletes an entry in one step.
+		// DefaultTokenCatalog refuses such a kind, and this covers a catalog
+		// that doesn't. Consuming it anyway would leave the token usable.
+		return nil, errs.NewConfigurationError(op, fmt.Sprintf("kind %q is single-use and not in the database: it can't be consumed exactly once", kind), nil)
 	}
+
+	// Fetch, validate and consume in one transaction. ConsumeToken is what
+	// makes it at-most-once: a concurrent Consume that read the token before
+	// this one stamped it still loses.
+	var result *models.Token
+	consumeErr := tm.st.Transaction(ctx, func(ctx context.Context, tx *store.Store) error {
+		tok, err := tm.fetch(ctx, tx, def, kind, rawToken)
+		if err != nil {
+			return err // already fully classified inside fetch
+		}
+		if err := checkConsumable(tok, tx.Now()); err != nil {
+			return err
+		}
+		at, err := tx.ConsumeToken(ctx, tok.ID)
+		if err != nil {
+			return err
+		}
+		tok.ConsumedAt = &at
+		result = tok
+		return nil
+	})
 
 	if consumeErr != nil {
 		hctx := hookContext(ctx, tm.auth, hooks.HookTokenFailed, core.FailedHookPhase)

@@ -18,10 +18,16 @@ const (
 	TokenKindAPIKey            models.TokenKind = "api_key"
 )
 
+// TokenBackend names where the tokens of a kind are kept.
 type TokenBackend string
 
 const (
+	// TokenBackendDB keeps tokens in the tokens table.
 	TokenBackendDB TokenBackend = "db"
+	// TokenBackendKV keeps tokens in the key-value storage, which removes
+	// each one when it expires. It holds multi-use kinds only: the key-value
+	// storage has no operation that reads and deletes an entry in one step,
+	// so it can't consume a token exactly once.
 	TokenBackendKV TokenBackend = "kv"
 )
 
@@ -37,7 +43,11 @@ type TokenConfig struct {
 	TTLOverrides map[models.TokenKind]time.Duration // overrides TokenKindDef.DefaultTTL per kind
 }
 
+// TokenCatalog holds the token kinds that plugins declare.
 type TokenCatalog interface {
+	// Declare adds a kind. It returns a configuration error after Boot, for
+	// an empty kind or owner, for an unknown backend, for a single-use kind
+	// on TokenBackendKV, and for a kind that is already declared.
 	Declare(def TokenKindDef) error
 	Lookup(kind models.TokenKind) (TokenKindDef, bool)
 }

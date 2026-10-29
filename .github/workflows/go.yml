@@ -1,21 +1,35 @@
-# Runs the tests of every Go module in the repository.
+# Runs the tests of every Go module in the repository, and measures their
+# coverage.
 #
 # The root module, each storage, router and telemetry adapter, the examples
 # and tests/ each have a go.mod of their own, so `go test ./...` at the root
-# covers the root module only. This workflow has four jobs:
+# covers the root module only. This workflow has five jobs:
 #
 #   modules           finds every go.mod outside tests/, so that a module
 #                     added later is tested without a change here.
 #   test-modules      builds, vets and tests each of those modules on the
 #                     two newest Go releases. Their tests need no service.
 #   test-integration  runs tests/, whose suites start database containers
-#                     (Postgres, MySQL, SQL Server, MongoDB) through
-#                     testcontainers, on the runner's Docker. The slow
-#                     container suites run on runners of their own.
-#   test-suite        succeeds only when the three jobs above all did. It is
-#                     the one check a branch ruleset requires: the checks of
-#                     the other jobs are named after a module or a Go release,
-#                     so a list of them would change with every module added.
+#                     (Postgres, MySQL, SQL Server, MongoDB, Redis) through
+#                     testcontainers, on the runner's Docker. It runs once on
+#                     the oldest supported releases of Go and of each
+#                     database, and once on the newest. The slow container
+#                     suites run on runners of their own.
+#   coverage          merges the coverage profiles of the test jobs that ran
+#                     on the newest Go release, and checks each published
+#                     package against its target in
+#                     scripts/coverage_targets.txt. The report is in the
+#                     job's summary, and the merged profile and an annotated
+#                     view of the source are in its artifact. On a push, it
+#                     uploads the merged profile to Codecov for the badge in
+#                     the README.
+#   test-suite        succeeds only when the jobs above all did. It is the one
+#                     check a branch ruleset requires: the checks of the other
+#                     jobs are named after a module or a release, so a list of
+#                     them would change with every module added.
+#
+# Every test runs through scripts/coverage.sh test, so that CI and a local
+# run of the script measure the same thing.
 
 name: Go - Behemoth Test
 
@@ -65,8 +79,15 @@ jobs:
         # supports, and not the toolchain to test with: the toolchain is the
         # newest patch of each of the two newest releases, so that CI runs
         # with the standard library fixes. Move both when a new Go release
-        # comes out.
+        # comes out, together with the releases of test-integration and the
+        # release of the coverage job.
         go: [ "1.26.x", "1.27.x" ]
+        include:
+          # Coverage comes from the newest release only: the blocks of a
+          # package can differ between releases, so their profiles can't be
+          # merged.
+          - go: "1.27.x"
+            coverage: true
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -86,14 +107,29 @@ jobs:
     - name: Vet
       run: go vet ./...
 
-    # -count=1: the Go cache is restored between runs, and it holds test
-    # results. Without it a test could be reported from the cache.
+    # The script runs go test with -count=1: the Go cache is restored between
+    # runs, and it holds test results. Without it a test could be reported
+    # from the cache.
     - name: Test
-      run: go test -count=1 ./...
+      run: |
+        "$GITHUB_WORKSPACE/scripts/coverage.sh" test . "$RUNNER_TEMP/coverage.out"
+
+    - name: Upload the coverage profile
+      if: matrix.coverage
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: profile-module-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/coverage.out
+        if-no-files-found: error
+        retention-days: 7
 
   test-integration:
-    name: Integration ${{ matrix.group }}
-    runs-on: ubuntu-latest
+    name: Integration ${{ matrix.group }} (${{ matrix.releases }} releases)
+    # MongoDB 8 refuses to start on Linux 6.19 and later
+    # (https://jira.mongodb.org/browse/SERVER-121912), and ubuntu-latest moves
+    # to a newer kernel with the next Ubuntu release. Move to ubuntu-latest
+    # once the mongo image below starts there.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -102,6 +138,35 @@ jobs:
         # other package of tests/, found with go list, so a package added
         # later runs there.
         group: [ store, storage, other ]
+        # Each supported release runs once. oldest pairs the oldest supported
+        # Go release with the oldest supported release of each database,
+        # which tests/testutils starts when no variable names another image.
+        # newest pairs the newest of each. A Go release and a database
+        # release change different code, so a failure that only one pairing
+        # of the two shows is unlikely, and two runs test what four would.
+        #
+        # docs/api/supported-databases.md lists the releases. Move an image
+        # below when its database has a new major release, and the Go
+        # releases with those of test-modules.
+        releases: [ oldest, newest ]
+        include:
+          - releases: oldest
+            go: "1.26.x"
+          - releases: newest
+            go: "1.27.x"
+            coverage: true
+            postgres: postgres:18
+            mysql: mysql:9
+            sqlserver: mcr.microsoft.com/mssql/server:2025-latest
+            mongo: mongo:8
+            redis: redis:8-alpine
+    env:
+      # Empty for the oldest releases: tests/testutils then starts its own.
+      BEHEMOTH_TEST_POSTGRES_IMAGE: ${{ matrix.postgres }}
+      BEHEMOTH_TEST_MYSQL_IMAGE: ${{ matrix.mysql }}
+      BEHEMOTH_TEST_MSSQL_IMAGE: ${{ matrix.sqlserver }}
+      BEHEMOTH_TEST_MONGO_IMAGE: ${{ matrix.mongo }}
+      BEHEMOTH_TEST_REDIS_IMAGE: ${{ matrix.redis }}
     defaults:
       run:
         working-directory: tests
@@ -111,7 +176,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
       with:
-        go-version: 1.27.x
+        go-version: ${{ matrix.go }}
         check-latest: true
         cache-dependency-path: "**/go.sum"
 
@@ -126,11 +191,82 @@ jobs:
           storage) packages="./storage/..." ;;
           other)   packages=$(go list ./... | grep -v -E '/tests/(store|storage)(/|$)') ;;
         esac
-        go test -count=1 -timeout 25m $packages
+        "$GITHUB_WORKSPACE/scripts/coverage.sh" test . "$RUNNER_TEMP/coverage.out" $packages
+
+    - name: Upload the coverage profile
+      if: matrix.coverage
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: profile-integration-${{ strategy.job-index }}
+        path: ${{ runner.temp }}/coverage.out
+        if-no-files-found: error
+        retention-days: 7
+
+  coverage:
+    name: Coverage
+    needs: [ test-modules, test-integration ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The Codecov upload proves with an OIDC token that it comes from this
+      # repository, so no upload token is stored.
+      id-token: write
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+    # The release the profiles come from. go tool cover reads them to write
+    # the annotated source.
+    - name: Set up Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      with:
+        go-version: 1.27.x
+        check-latest: true
+        cache-dependency-path: "**/go.sum"
+
+    - name: Download the coverage profiles
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        pattern: profile-*
+        path: ${{ runner.temp }}/profiles
+
+    - name: Report and check the coverage
+      run: |
+        scripts/coverage.sh report -o "$RUNNER_TEMP/coverage.out" \
+          --markdown "$GITHUB_STEP_SUMMARY" --html "$RUNNER_TEMP/coverage.html" \
+          "$RUNNER_TEMP"/profiles/*/coverage.out
+
+    # Codecov keeps the coverage of each push to dev and main, for the badge
+    # in the README and its history. It only shows the coverage: the step
+    # above is the check, and .github/codecov.yml turns Codecov's own checks
+    # and comments off. A failed upload doesn't fail the run, so that an
+    # outage of Codecov doesn't block the branch. The profile is the merged
+    # one, so the badge shows the total of the report above.
+    - name: Upload the coverage to Codecov
+      if: github.event_name == 'push'
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        use_oidc: true
+        files: ${{ runner.temp }}/coverage.out
+        disable_search: true
+        plugins: noop
+        disable_telem: true
+        fail_ci_if_error: false
+
+    # Kept when the check fails too, to see which statements no test runs.
+    - name: Upload the report
+      if: success() || failure()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: coverage
+        path: |
+          ${{ runner.temp }}/coverage.out
+          ${{ runner.temp }}/coverage.html
+        retention-days: 30
 
   test-suite:
     name: Behemoth Test Suite
-    needs: [ modules, test-modules, test-integration ]
+    needs: [ modules, test-modules, test-integration, coverage ]
     # always(): when a needed job fails, a job that only lists it in needs is
     # skipped, and GitHub counts a skipped required check as passed.
     if: always()
