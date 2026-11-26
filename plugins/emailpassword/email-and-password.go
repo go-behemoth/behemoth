@@ -286,41 +286,44 @@ func (c *EmailAndPasswordCredentials) FromMap(data map[string]any) error {
 	return nil
 }
 
-// IdentifierCredentials is the input of SignInWith: a sign-in by password
-// for a user who is named by something other than an email. The username
-// plugin signs in with it, with Key "username".
+// IdentifierCredentials holds the input of SignInWith: password based sign-in
+// using an identifier other than an email address. The username plugin uses it with Key set to "username".
 //
 // It implements [behemoth.Serializable]. The auth.signIn.before payload is
-// flat, like an email sign-in's: Value under Key, "password", and the keys
-// of Extra. Method and Find are not part of it.
+// flat, like an email sign-in's payload. Value is published under Key, Password under "password",
+// and Extra's keys are added directly.
+// Method and Find are excluded.
 type IdentifierCredentials struct {
-	// Key names the identifier: the payload key Value sits under, and the
-	// HookContext.Values key it is published under for rate-limit rules.
-	// Required, and not "password".
+	// Key is the payload key for Value and the HookContext.Values key used
+	// by rate-limit rules. Required; cannot be "password".
 	Key string
-	// Value is the identifier the caller sent, in the form a rule should
-	// count it by: SignInWith publishes it as it is.
+	// Value is the identifier as provided by the caller. SignInWith
+	// Key names the identifier: the payload key Value sits under, and the
+	// HookContext.
 	Value    string
 	Password string
-	// Extra holds input only handlers on auth.signIn.before read, as in
-	// EmailAndPasswordCredentials.
+
+	// Extra contains additional input for auth.signIn.before handlers,
+	// like Extra in EmailAndPasswordCredentials.
 	Extra behemoth.M
-	// Method is the SignInResult's Method: the name of the plugin that
-	// calls SignInWith. Empty means this plugin's.
+
+	// Method is the plugin name reported in SignInResult. Defaults to
+	// the calling plugin when empty.
 	Method string
-	// Find looks the user up by the identifier, after the before chain, so
-	// value is what the handlers left. It returns a NotFound error when no
-	// user matches; any other error is a failure of the system. Required.
+
+	// Find looks up the user after the before hooks run, using the
+	// potentially modified identifier. It must return NotFound if no
+	// user matches; other errors indicate a system failure.
 	Find func(ctx context.Context, s *store.Store, value string) (*models.User, error)
 
-	// normalize puts Value in the form a failed sign-in's audit event
-	// records. nil = as it is.
+	// normalize formats Value for the failed-sign-in audit event.
+	// nil leaves it unchanged.
 	normalize func(string) string
 }
 
-// ToMap returns the credentials as a hook payload: a copy of Extra with Key
-// and "password" set from the fields, so a key of Extra with one of those
-// names does not replace them.
+// ToMap returns a map representation of IdentifierCredentials with
+// copy of Extra with Key and "password" set from the credential fields,
+// ensuring they take precedence over any existing values.
 func (c *IdentifierCredentials) ToMap() (map[string]any, error) {
 	m := make(map[string]any, len(c.Extra)+2)
 	maps.Copy(m, c.Extra)
@@ -328,9 +331,9 @@ func (c *IdentifierCredentials) ToMap() (map[string]any, error) {
 	return m, nil
 }
 
-// FromMap sets Value, Password and Extra from a rewritten payload, by the
-// rules of EmailAndPasswordCredentials.FromMap. Key, Method and Find are
-// kept: a handler can't change how the user is looked up.
+// FromMap updates Value, Password, and Extra from the rewritten payload
+// using the same rules as EmailAndPasswordCredentials.FromMap.
+// Key, Method, and Find remain unchanged to preserve the lookup behavior.
 func (c *IdentifierCredentials) FromMap(data map[string]any) error {
 	value, password, extra, err := credentialFields(c.Key, data)
 	if err != nil {
@@ -340,10 +343,8 @@ func (c *IdentifierCredentials) FromMap(data map[string]any) error {
 	return nil
 }
 
-// credentialFields reads a sign-in's fields from a request body or a
-// payload: the identifier under key, "password", and every other key as the
-// extra input. A missing or null identifier or password is empty; one that
-// is not a string is a validation error.
+// credentialFields extracts the identifier, password, and extra fields from a given payload map.
+// Missing or null values default to empty, while non-string values return a validation error.
 func credentialFields(key string, data map[string]any) (value, password string, extra behemoth.M, err error) {
 	field := func(key string) (string, error) {
 		switch v := data[key].(type) {
@@ -373,26 +374,26 @@ func credentialFields(key string, data map[string]any) (value, password string, 
 	return value, password, extra, nil
 }
 
-// Codes of the errors sign-up returns for its own rejections. A client
+// Error Codes for sign-up validation and rejection responses.
+// Clients should use these codes rather than the messages to identify the error.
 // tells them apart by the code, not by the message.
 const (
-	// ErrorCodeInvalidEmail is the code of the validation error (400) for
-	// an email that is missing, not a string, or refused by
-	// Options.ValidateEmail.
+	// ErrorCodeInvalidEmail is returned (400) when the email is missing,
+	// not a string, or rejected by Options.ValidateEmail.
 	ErrorCodeInvalidEmail = "email_invalid_input"
-	// ErrorCodeInvalidPassword is the code of the validation error (400)
-	// for a password the plugin's rules refuse, at sign-up and at a
-	// password reset.
+
+	// ErrorCodeInvalidPassword is returned (400) when the password
+	// fails the plugin's validation rules during sign-up or password reset.
 	ErrorCodeInvalidPassword = "password_invalid_input"
-	// ErrorCodeEmailTaken is the code of the conflict error (409) for a
-	// sign-up with an email that already has an account.
+
+	// ErrorCodeEmailTaken is returned (409) when the email
+	// is already associated with an existing account.
 	ErrorCodeEmailTaken = "email_taken"
 )
 
-// errInvalidEmail and errInvalidPassword are sign-up's validation errors.
-// cause is the error of the check that refused, kept for logs: its text is
-// not sent to the client, since Options.ValidateEmail and ValidatePassword
-// are the application's and may say more than a stranger should read.
+// errInvalidEmail and errInvalidPassword create sign-up validation errors.
+// The underlying cause is retained for logging but not exposed to clients,
+// since application-defined validators may return sensitive details.
 func errInvalidEmail(cause error) error {
 	return errs.NewInvalidInputError("emailpassword.SignUp", credentialEmailKey, "invalid email", cause)
 }
@@ -402,7 +403,7 @@ func errInvalidPassword(op string, cause error) error {
 }
 
 // errEmailTaken is sign-up's typed conflict (409) for an email that already
-// has an account.
+// has an associated account.
 func errEmailTaken() error {
 	const op, message = "emailpassword.SignUp", "an account with this email already exists"
 	return &errs.DomainError{
@@ -431,7 +432,9 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 	}
 
 	emailTaken := func() error {
-		if err := dispatcher.Fail(hctx, hooks.HookSignUpFailed, core.FailureReason{Code: "user_exists", Metadata: behemoth.M{hooks.HookValueEmail: email}}); err != nil {
+		if err := dispatcher.Fail(
+			hctx, hooks.HookSignUpFailed,
+			core.FailureReason{Code: "user_exists", Metadata: behemoth.M{hooks.HookValueEmail: email}}); err != nil {
 			return err
 		}
 		return errEmailTaken()
@@ -452,16 +455,16 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 		return nil, err // infra error - no Fail()
 	}
 
-	// Only these profile fields are taken from the request. Never the whole
-	// payload: every column a model knows — contributed ones included — would
-	// become client-writable (mass assignment: "role": "admin", a verified
-	// flag, ...). The store assigns the id and timestamps, and fires
-	// data.user.beforeCreate / afterCreate (Tier 1) — hooks are where other
-	// plugins add their columns. The password hash goes to the user's
-	// "credential" account, created with the user or not at all. The data
-	// hooks run inside this transaction, so data.user.afterCreate can see a
-	// user that the account insert then rolls back; auth.signUp.after fires
-	// only once the transaction has committed.
+	// Only accept these profile fields from the request.
+	// Passing the entire payload would make every model column, including
+	// plugin-added ones, client-writable (e.g. role: "admin" or verified flags).
+	// The store assigns the id and timestamps, and fires
+	// data.user.beforeCreate / afterCreate hooks (Tier 1), where plugins
+	// can populate their own fields. The password hash goes to the user's "credential" account,
+	// created with the user in the same atomic transaction.
+	// The data hooks run inside this transaction, so data.user.afterCreate can see a
+	// user that the account insert then rolls back.
+	// auth.signUp.after runs only once the transaction has committed.
 	profile := func(key string) string { v, _ := userData[key].(string); return strings.TrimSpace(v) }
 	user := &models.User{
 		Firstname: profile(models.UserFirstname),
@@ -482,18 +485,15 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 		})
 	})
 	if err != nil {
-		// Another sign-up took the email after the lookup above: the
-		// database refused the insert. It is answered as the lookup would
-		// have answered.
+		// Another sign-up took the email after the lookup above. Treat
+		// the database conflict the same as the existing email error.
 		if slices.Equal(errs.DuplicateKeyColumns(err), []string{models.UserEmail}) {
 			return nil, emailTaken()
 		}
-		// Otherwise the error is returned as it is. A typed one keeps its
-		// category and public message: a data hook's veto on
-		// data.user.beforeCreate or afterCreate, or a classified store
-		// error, such as the conflict of another unique column a plugin
-		// added (username_taken). An untyped one is a failure of the
-		// system: the router answers 500 without its text and logs it.
+		// Preserve all other errors. Typed errors keep their category and public message,
+		// including hook rejections and classified store errors (e.g. a plugin-added unique constraint like username_taken).
+		// Untyped errors are treated as internal failures and
+		// the router returns a generic 500 response and logs the original error.
 		return nil, core.FailIfRejected(dispatcher, hctx, hooks.HookSignUpFailed, err,
 			core.FailureReason{Metadata: behemoth.M{hooks.HookValueEmail: email}})
 	}
@@ -501,19 +501,17 @@ func (p *Plugin) signUpBody(hctx *core.HookContext, userData behemoth.M) (*model
 	return user, nil
 }
 
-// hashPassword hashes password with the AuthContext's hasher, under the
-// operation's context. The hasher traces the hash and bounds how many run at
-// once, so it can refuse with a busy error (errs.CodeServerBusy).
+// hashPassword hashes the password using the AuthContext's hasher and the
+// operation's context. It also traces hashing and limits concurrent runs,
+// returning errs.CodeServerBusy when the limit is reached.
 func hashPassword(hctx *core.HookContext, password string) (string, error) {
 	return hctx.Auth.Crypto.Passwords.Hash(hctx.Ctx, password)
 }
 
-// decoyHash hashes a password that is thrown away, so that an answer takes
-// as long as one that hashes: a sign-in refused before any password was
-// checked, and a sign-up for a taken email. Its error is returned to the
-// caller, as Verify's and a real hash's are: a busy hasher then answers 503
-// for an unknown email as for a known one, and the answer doesn't tell which
-// emails have an account. See ADR-0010.
+// decoyHash performs a dummy password hash to keep response times consistent
+// when sign-in is rejected before password verification or sign-up uses an existing email.
+// It returns hashing errors so a busy hasher produces the
+// same 503 response for known and unknown emails, preventing account enumeration. See ADR-0010.
 func decoyHash(hctx *core.HookContext, password string) error {
 	_, err := hashPassword(hctx, password)
 	return err
@@ -523,14 +521,13 @@ func decoyHash(hctx *core.HookContext, password string) error {
 // unknown email, a user without a password and a wrong password.
 const ErrorCodeInvalidCredentials = "invalid_credentials"
 
-// errInvalidCredentials is sign-in's one answer to every credential it
-// refuses. The three cases share a code and a message so the response does
-// not tell which emails have an account. It is typed (unauthorized, 401), so
-// a caller can tell it from a failure of the system, which is any other
-// error SignIn returns apart from a hook handler's typed rejection.
+// errInvalidCredentials returns the same unauthorized error for all rejected
+// credentials, preventing the response from revealing whether an account exists.
+// Its typed 401 error also distinguishes invalid credentials from system failures and
+// other errors returned by SignIn.
 //
-// identifier is the credentials' Key, for the message: "invalid email or
-// password", "invalid username or password". The code is the same for all.
+// identifier is the credential key used in the message, e.g. "email" or
+// "username". The error code remains the same for all identifiers.
 func errInvalidCredentials(identifier string) error {
 	return errs.NewUnauthorized("emailpassword.SignIn", ErrorCodeInvalidCredentials, "invalid "+identifier+" or password")
 }
@@ -560,7 +557,7 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 			}
 			return nil, errInvalidCredentials()
 		}
-		return nil, err // infra error (DB down) — must NOT count toward lockout
+		return nil, err // infra error (DB down) - must not count toward ratelimiter lockout
 	}
 
 	// Every rejection from here on is an attempt on a known account, and
@@ -583,12 +580,12 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 			}
 			return nil, errInvalidCredentials()
 		}
-		return nil, err // infra error — must NOT count toward lockout
+		return nil, err // infra error - must not count toward ratelimiter lockout
 	}
 
 	isValid, err := hasher.Verify(hctx.Ctx, credential.PasswordHash, creds.Password)
 	if err != nil {
-		return nil, err // a busy hasher, a malformed stored hash or a key error — not a wrong password, so not counted as one
+		return nil, err // a busy hasher, a malformed stored hash or a key error - not a wrong password, so not counted as one
 	}
 
 	if !isValid {
@@ -598,12 +595,13 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 		return nil, errInvalidCredentials()
 	}
 
-	// The seam a 2FA plugin hooks. requireStepUp travels back via the mutated
-	// payload - this is the mechanism by which SignIn decides Pending vs Active
-	// without knowing anything about TOTP, backup codes, etc. Any plugin may
-	// refuse the sign-in here, so a refusal is reported as one by a hook and
-	// not as a second factor's. See ADR-0001. The payload names the factor this
-	// sign-in checked, which a second factor must not repeat. See ADR-0009.
+	// This hook allows 2FA plugins to participate in the sign-in flow.
+	// Plugins can set requireStepUp in the payload to signal that additional
+	// verification is needed, letting SignIn decide between Pending and Active
+	// without knowing the details of individual factors. Any plugin can reject
+	// the sign-in, and such rejections are treated as hook errors.
+	// The payload also identifies the factor already verified so subsequent
+	// factors don't repeat it. See ADR-0001 and ADR-0009.
 	checkpoint, err := dispatcher.RunBefore(hctx, hooks.HookSignInCredentialsVerified,
 		behemoth.M{hooks.HookValueUserID: user.ID, hooks.HookValueFactor: core.FactorPassword})
 	if err != nil {
@@ -636,17 +634,16 @@ func (p *Plugin) signInBody(hctx *core.HookContext, creds IdentifierCredentials)
 // of SignIn.
 type SignInResult = core.SignInResult
 
-// SignUp creates a user with an email and a password, and the user's
-// credential account. input holds the sign-up fields under their column
-// names ("email", "password", and optionally "firstname", "lastname",
-// "image_url"); other keys are not stored, but handlers on
-// auth.signUp.before see them. It fires auth.signUp.before, .after and
-// .failed.
+// SignUp creates a user and their email/password credential account. input contains
+// fields keyed by their column names ("email", "password", and optionally
+// "firstname", "lastname", and "image_url").
+// Other keys are not stored but are available to auth.signUp.before handlers.
+// The flow fires auth.signUp.before, auth.signUp.after, and auth.signUp.failed.
 //
-// It is the flow behind POST /sign-up/email, for callers that are not that
-// route: a CLI, a job, another plugin. Pass the context of the request being
-// handled when there is one; hook handlers get the request from it. The
-// plugin must have been initialized by Boot.
+// This is the programmatic equivalent of POST /sign-up/email,
+// intended for callers such as CLIs, jobs, and other plugins.
+// Pass the request context when available so hook handlers can access the request.
+// The plugin must be initialized through Boot.
 func (p *Plugin) SignUp(ctx context.Context, input behemoth.M) (*models.User, error) {
 	hctx, err := p.operation(ctx, "emailpassword.SignUp")
 	if err != nil {
@@ -658,16 +655,16 @@ func (p *Plugin) SignUp(ctx context.Context, input behemoth.M) (*models.User, er
 	return p.signUp(hctx, input)
 }
 
-// SignIn verifies creds and creates a session for the user. The session is
-// pending instead of active when a handler on auth.signIn.credentialsVerified
-// asked for a second factor. It fires auth.signIn.before, .after and
-// .failed. Handlers on auth.signIn.before see creds.Extra next to the email
-// and password.
+// SignIn verifies the credentials and creates a session for the user.
+// The session is pending if a handler on auth.signIn.credentialsVerified
+// requires a second factor. The flow fires auth.signIn.before,
+// auth.signIn.after, and auth.signIn.failed. Handlers on
+// auth.signIn.before can access creds.Extra alongside the email and password.
 //
-// It is the flow behind POST /sign-in/email. Like SignUp it runs without an
-// HTTP request; the session then records no IP address or user agent unless
-// the caller's context carries a request. The raw session token is in the
-// result and is the caller's to deliver.
+// This is the programmatic equivalent of POST /sign-in/email. It can also
+// run without an HTTP request, in which case the session has no IP address
+// or user agent unless the context carries a request. The raw session token
+// is returned for the caller to deliver.
 func (p *Plugin) SignIn(ctx context.Context, creds EmailAndPasswordCredentials) (*SignInResult, error) {
 	hctx, err := p.operation(ctx, "emailpassword.SignIn")
 	if err != nil {
@@ -684,21 +681,21 @@ func (p *Plugin) SignIn(ctx context.Context, creds EmailAndPasswordCredentials) 
 	})
 }
 
-// SignInWith is SignIn for a user named by something other than an email:
-// creds.Find looks the user up, and the password check, the second-factor
-// checkpoint and the session are this plugin's, as in SignIn. It fires the
-// same auth.signIn.* points, and answers a user Find does not know, a user
-// without a password and a wrong password with the same typed error.
+// SignInWith authenticates a user using an identifier other than email.
+// creds.Find handles the user lookup, while this plugin handles password
+// verification, the second-factor checkpoint, and session creation, just as
+// SignIn does. It fires the same auth.signIn.* hooks and returns the same
+// error for unknown users, users without a password, and incorrect passwords.
 //
-// It is how a plugin adds an identifier without checking passwords itself:
-// the username plugin's sign-in is a call of it. That plugin names this one
-// in PluginMeta.Dependencies and is given it at construction.
+// This allows other plugins to add sign-in methods without implementing
+// password verification themselves. For example, the username plugin uses
+// this method and declares this plugin as a dependency in PluginMeta.Dependencies.
 //
-// creds.Value is published in the operation's Values under creds.Key, where
-// a rate-limit rule on auth.signIn.before keys on it, and creds.Method under
-// hooks.HookValueMethod, where core's per-address rule does. No email is
-// published: it is not known before the lookup, so a rule per email does not
-// count these sign-ins.
+// creds.Value is stored in the operation's Values under creds.Key for
+// rate limiting on auth.signIn.before. creds.Method is stored under
+// hooks.HookValueMethod for core's per-address rate limiting. No email is
+// published because it is not available until after the user lookup, so
+// these sign-ins are not subject to per-email rate limits.
 func (p *Plugin) SignInWith(ctx context.Context, creds IdentifierCredentials) (*SignInResult, error) {
 	const op = "emailpassword.SignInWith"
 	hctx, err := p.operation(ctx, op)
@@ -726,14 +723,13 @@ func (p *Plugin) SignInWith(ctx context.Context, creds IdentifierCredentials) (*
 	return p.signIn(hctx, creds)
 }
 
-// publishEmail puts the email a sign-up or sign-in was called with in the
-// operation's Values, under hooks.HookValueEmail and in its stored form
-// (store.NormalizeEmail). A rate-limit rule on the flow's before point keys
-// on it there: HookRateLimitRule.KeyFunc gets the HookContext and not the
-// payload. It is the email the caller sent, so a before handler that
-// rewrites the payload's email does not move the attempt to another count.
-// A call without an email leaves no entry, and removes the one inherited
-// from an enclosing operation, so a rule per email does not apply to it.
+// publishEmail stores the normalized email in the operation's Values under
+// hooks.HookValueEmail. Rate-limit rules read it from the HookContext rather
+// than the payload, so rewriting the email in a before handler does not
+// change which email the attempt is counted against.
+//
+// If the email is empty, the entry is removed, including any value inherited
+// from an enclosing operation, so per-email rate limits are not applied.
 func publishEmail(hctx *core.HookContext, email string) {
 	if email = store.NormalizeEmail(email); email == "" {
 		delete(hctx.Values, hooks.HookValueEmail)
@@ -742,7 +738,7 @@ func publishEmail(hctx *core.HookContext, email string) {
 	hctx.Values[hooks.HookValueEmail] = email
 }
 
-// operation builds the HookContext one flow call runs with. Its Values start
+// operation builds the HookContext a flow call runs with. Its Values start
 // as a copy of the operation ctx already belongs to, if any, and Request is
 // the request ctx carries, or nil.
 func (p *Plugin) operation(ctx context.Context, op string) (*core.HookContext, error) {
@@ -756,21 +752,20 @@ func (p *Plugin) operation(ctx context.Context, op string) (*core.HookContext, e
 	}, nil
 }
 
-// SignOut ends the session the caller on ctx signed in with. It fires
-// auth.signOut.before and .after around the revoke, as one operation: both
-// points share Values, and the session manager's revoke points start from a
-// copy of them.
+// SignOut revokes the session associated with the caller's context.
+// It fires auth.signOut.before and auth.signOut.after around the revoke.
+// Both hooks share the same operation Values, which are also passed to
+// the session manager's revoke hooks.
 //
-// The caller needs PermissionSignOut (Access.RequireUser) and a session. A
-// caller that is not signed in gets the reason as a session error, as from
-// RequireSession, and a system caller acting for a user, which has no
-// session, gets errs.CodeSessionMissing. Ending another client's session is
-// not a self-service flow: code that has to does it with
-// SessionManager.Revoke.
+// The caller must have PermissionSignOut (Access.RequireUser) and an active
+// session. Unsigned callers receive the same session error as RequireSession.
+// System callers acting on behalf of a user have no session and receive
+// errs.CodeSessionMissing. Revoking another client's session is not a
+// self-service operation; use SessionManager.Revoke directly.
 //
-// It is the flow behind POST /sign-out, and writes nothing to a response. A
-// route that signs its caller out takes the token back afterwards
-// (TokenCarrier.Clear), as the plugin's sign-out route does.
+// This is the programmatic equivalent of POST /sign-out. It does not write
+// to the response. Routes that sign out the caller must clear the session
+// token afterward using TokenCarrier.Clear, as the plugin's route does.
 func (p *Plugin) SignOut(ctx context.Context) error {
 	const op = "emailpassword.SignOut"
 	hctx, err := p.operation(ctx, op)
@@ -799,12 +794,12 @@ func (p *Plugin) SignOut(ctx context.Context) error {
 	return ac.Dispatcher.RunAfter(hctx, hooks.HookSignOutAfter, nil)
 }
 
-// handleSignUp returns the flow's error unchanged, like handleSignIn, and
-// the router maps and logs it (RouterConfig.ErrorMapper). The flow's own
-// rejections are typed: a validation error (400) for the email or the
-// password, a conflict (409) for an email that is taken. A hook handler's
-// typed rejection keeps its own status. Anything else is a failure of the
-// system: the router answers 500 without the error's text and logs it.
+// handleSignUp returns flow errors unchanged, leaving the router to map and
+// log them through RouterConfig.ErrorMapper. Sign-up validation errors are
+// typed (400), and an already registered email returns a conflict (409).
+// Typed rejections from hook handlers retain their own status codes.
+// All other errors are treated as system failures: the router returns 500
+// without exposing the error message and logs the underlying error.
 func (p *Plugin) handleSignUp(rctx *httpapi.RequestContext) error {
 	var body behemoth.M
 	if err := json.NewDecoder(rctx.Request.Body).Decode(&body); err != nil {
@@ -824,11 +819,12 @@ func (p *Plugin) handleSignUp(rctx *httpapi.RequestContext) error {
 	return rctx.Response.JSON(http.StatusCreated, behemoth.M{httpapi.SignInUserKey: view})
 }
 
-// handleSignIn returns the flow's error unchanged, and the router maps and
-// logs it (RouterConfig.ErrorMapper). A refused credential is a typed
-// unauthorized error (401), and a hook handler's typed rejection keeps its
-// own status. Anything else is a failure of the system: the router answers
-// 500 without the error's text and logs it at Error.
+// handleSignIn returns flow errors unchanged, leaving the router to map and
+// log them through RouterConfig.ErrorMapper. Sign-in validation errors are
+// typed (400), and an already registered email returns a conflict (409).
+// Typed rejections from hook handlers retain their own status codes.
+// All other errors are treated as system failures: the router returns 500
+// without exposing the error message and logs the underlying error.
 func (p *Plugin) handleSignIn(rctx *httpapi.RequestContext) error {
 	// The body is decoded as a map so that fields other than the email and
 	// password reach the before handlers, in creds.Extra.
@@ -851,11 +847,12 @@ func (p *Plugin) handleSignIn(rctx *httpapi.RequestContext) error {
 	return httpapi.WriteSignIn(rctx, result, nil)
 }
 
-// handleSignOut returns SignOut's error unchanged, like handleSignIn. A typed
-// error keeps its status (a hook handler's rejection, a session that no
-// longer exists). A failed revoke is a 500 from the router, which does not
-// send the error's text. After a sign-out that went through, it takes the
-// session token back from the client.
+// handleSignOut returns flow errors unchanged, leaving the router to map and
+// log them through RouterConfig.ErrorMapper.
+// Typed rejections from hook handlers retain their own status codes.
+// All other errors are treated as system failures: the router returns 500
+// without exposing the error message and logs the underlying error.
+// It then takes the session token back from the client after successful sign-out
 func (p *Plugin) handleSignOut(rctx *httpapi.RequestContext) error {
 	if err := p.SignOut(rctx.Ctx); err != nil {
 		return err

@@ -70,8 +70,8 @@ func (passDispatcher) Fail(*core.HookContext, core.HookPoint, core.FailureReason
 	return nil
 }
 
-// authContext wires what Boot would, by hand, with a pass-through
-// dispatcher. TestEmailPasswordThroughPrepareAndBoot covers the booted path.
+// authContext manually sets up the same wiring Boot would, using a pass-through dispatcher.
+// TestEmailPasswordThroughPrepareAndBoot tests the actual boot flow
 func authContext(t *testing.T) *core.AuthContext {
 	t.Helper()
 	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "ep.db")+"?_foreign_keys=on")
@@ -159,7 +159,7 @@ func TestEmailPasswordSignUpAndSignInThroughTheStore(t *testing.T) {
 	}
 
 	w := call(t, ac, routes["/sign-up/email"],
-		`{"email":"  Ada@Example.COM ","password":"correct horse","firstname":"Ada","email_verified":true,"role":"admin"}`)
+		`{"email":"  Ada@Example.COM ","password":"my-primus-stove","firstname":"Ada","email_verified":true,"role":"admin"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	assert.NotContains(t, w.Body.String(), "PasswordHash", "the response never carries the password hash")
 	assert.NotContains(t, w.Body.String(), "argon2", "the response never carries the password hash")
@@ -182,12 +182,12 @@ func TestEmailPasswordSignUpAndSignInThroughTheStore(t *testing.T) {
 
 	// Sign-up's own rejections are typed: a client reads the code.
 	for body, code := range map[string]string{
-		`{`:                            "request_validation_error",
-		`{"password":"correct horse"}`: emailpassword.ErrorCodeInvalidEmail,
-		`{"email":42,"password":"correct horse"}`:             emailpassword.ErrorCodeInvalidEmail,
-		`{"email":"not an email","password":"correct horse"}`: emailpassword.ErrorCodeInvalidEmail,
-		`{"email":"grace@example.com"}`:                       emailpassword.ErrorCodeInvalidPassword,
-		`{"email":"grace@example.com","password":"short"}`:    emailpassword.ErrorCodeInvalidPassword,
+		`{`:                              "request_validation_error",
+		`{"password":"my-primus-stove"}`: emailpassword.ErrorCodeInvalidEmail,
+		`{"email":42,"password":"my-primus-stove"}`:             emailpassword.ErrorCodeInvalidEmail,
+		`{"email":"not an email","password":"my-primus-stove"}`: emailpassword.ErrorCodeInvalidEmail,
+		`{"email":"grace@example.com"}`:                         emailpassword.ErrorCodeInvalidPassword,
+		`{"email":"grace@example.com","password":"short"}`:      emailpassword.ErrorCodeInvalidPassword,
 	} {
 		w = call(t, ac, routes["/sign-up/email"], body)
 		assert.Equal(t, http.StatusBadRequest, w.Code, "sign-up body %s", body)
@@ -198,7 +198,7 @@ func TestEmailPasswordSignUpAndSignInThroughTheStore(t *testing.T) {
 	_, err = ac.Store.FindUserByEmail(ctx, "grace@example.com")
 	assert.True(t, errs.IsNotFound(err), "none of them created a user: %v", err)
 
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"ADA@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"ADA@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.NotContains(t, w.Body.String(), "argon2")
 	sessions, err := ac.Store.ListSessionsForUser(ctx, stored.ID)
@@ -212,7 +212,7 @@ func TestEmailPasswordSignUpAndSignInThroughTheStore(t *testing.T) {
 	oauthOnly := &models.User{Email: "grace@example.com"}
 	require.NoError(t, ac.Store.CreateUser(ctx, oauthOnly))
 	require.NoError(t, ac.Store.CreateAccount(ctx, &models.Account{UserID: oauthOnly.ID, ProviderID: "google", AccountID: "g-1"}))
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"grace@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"grace@example.com","password":"my-primus-stove"}`)
 	assert.NotEqual(t, http.StatusOK, w.Code, "no credential account, no password sign-in")
 }
 
@@ -229,7 +229,7 @@ func TestEmailPasswordSignInAndSignOutErrors(t *testing.T) {
 		routes[r.Path] = r
 	}
 	require.Equal(t, http.StatusCreated,
-		call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`).Code)
+		call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`).Code)
 	oauthOnly := &models.User{Email: "grace@example.com"}
 	require.NoError(t, ac.Store.CreateUser(ctx, oauthOnly))
 
@@ -239,8 +239,8 @@ func TestEmailPasswordSignInAndSignOutErrors(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, wrongPassword.Code)
 	assert.JSONEq(t, `{"error":"invalid email or password","code":"invalid_credentials"}`, wrongPassword.Body.String())
 	for name, body := range map[string]string{
-		"unknown email":         `{"email":"nobody@example.com","password":"correct horse"}`,
-		"no credential account": `{"email":"grace@example.com","password":"correct horse"}`,
+		"unknown email":         `{"email":"nobody@example.com","password":"my-primus-stove"}`,
+		"no credential account": `{"email":"grace@example.com","password":"my-primus-stove"}`,
 	} {
 		w := call(t, ac, routes["/sign-in/email"], body)
 		assert.Equal(t, wrongPassword.Code, w.Code, name)
@@ -264,7 +264,7 @@ func TestEmailPasswordSignInAndSignOutErrors(t *testing.T) {
 	signedIn := identity.WithCaller(ctx, identity.SignedIn(identity.SessionRef{ID: "s1", UserID: "u1", State: string(models.SessionActive)}, identity.Peer{}))
 	require.NoError(t, ac.Store.DB().(*sqliteAdapter.SQLiteAdapter).DB.(*sql.DB).Close())
 	for _, path := range []string{"/sign-in/email", "/sign-out"} {
-		w := callWith(t, signedIn, ac, routes[path], `{"email":"ada@example.com","password":"correct horse"}`)
+		w := callWith(t, signedIn, ac, routes[path], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 		assert.Equal(t, http.StatusInternalServerError, w.Code, path)
 		assert.JSONEq(t, `{"error":"an internal error occurred","code":"database_error"}`, w.Body.String(), path)
 	}
@@ -293,18 +293,18 @@ func TestEmailPasswordAnswersBusyTheSameForEveryEmail(t *testing.T) {
 	tel, rec := telemetrytest.New()
 	ac, routes := auditApp(t, tel, nil)
 	require.Equal(t, http.StatusCreated,
-		call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`).Code)
+		call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`).Code)
 	require.NoError(t, ac.Store.CreateUser(ctx, &models.User{Email: "grace@example.com"}))
 	ac.Crypto.Passwords = busyHasher{ac.Crypto.Passwords}
 
-	known := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	known := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	assert.Equal(t, http.StatusServiceUnavailable, known.Code)
 	assert.JSONEq(t, `{"error":"the server is busy, please try again later","code":"server_busy"}`, known.Body.String())
 	for name, tc := range map[string]struct{ path, body string }{
-		"sign-in, unknown email":         {"/sign-in/email", `{"email":"nobody@example.com","password":"correct horse"}`},
-		"sign-in, no credential account": {"/sign-in/email", `{"email":"grace@example.com","password":"correct horse"}`},
-		"sign-up, taken email":           {"/sign-up/email", `{"email":"ada@example.com","password":"correct horse"}`},
-		"sign-up, free email":            {"/sign-up/email", `{"email":"new@example.com","password":"correct horse"}`},
+		"sign-in, unknown email":         {"/sign-in/email", `{"email":"nobody@example.com","password":"my-primus-stove"}`},
+		"sign-in, no credential account": {"/sign-in/email", `{"email":"grace@example.com","password":"my-primus-stove"}`},
+		"sign-up, taken email":           {"/sign-up/email", `{"email":"ada@example.com","password":"my-primus-stove"}`},
+		"sign-up, free email":            {"/sign-up/email", `{"email":"new@example.com","password":"my-primus-stove"}`},
 	} {
 		w := call(t, ac, routes[tc.path], tc.body)
 		assert.Equal(t, known.Code, w.Code, name)
@@ -379,12 +379,12 @@ func TestEmailPasswordThroughPrepareAndBoot(t *testing.T) {
 	}
 	require.Len(t, routes, 3)
 
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
 	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"wrong password"}`)
 	assert.NotEqual(t, http.StatusOK, w.Code)
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.NotEmpty(t, rawToken)
 
@@ -469,7 +469,7 @@ func TestEmailPasswordSignUpReturnsADataHooksVeto(t *testing.T) {
 			signUp = r
 		}
 	}
-	req := httptest.NewRequest(http.MethodPost, signUp.Path, strings.NewReader(`{"email":"eve@blocked.example","password":"correct horse"}`))
+	req := httptest.NewRequest(http.MethodPost, signUp.Path, strings.NewReader(`{"email":"eve@blocked.example","password":"my-primus-stove"}`))
 	rctx := &httpapi.RequestContext{Request: req, Response: httpapi.NewResponseRecorder(), Values: behemoth.M{}, Auth: ac, TokenCarrier: headerCarrier}
 	rctx.Ctx = httpapi.ContextWithRequest(req.Context(), rctx)
 
@@ -487,12 +487,12 @@ func TestEmailPasswordSignUpReturnsADataHooksVeto(t *testing.T) {
 
 	// An untyped error is a failure of the system and not a rejection: a
 	// 500 without the error's text, and no failed point.
-	w := call(t, ac, signUp, `{"email":"eve@broken.example","password":"correct horse"}`)
+	w := call(t, ac, signUp, `{"email":"eve@broken.example","password":"my-primus-stove"}`)
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.NotContains(t, w.Body.String(), "connection reset")
 	assert.Len(t, failures, 1)
 
-	w = call(t, ac, signUp, `{"email":"ada@example.com","password":"correct horse"}`)
+	w = call(t, ac, signUp, `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	assert.Equal(t, http.StatusCreated, w.Code, "other sign-ups are unaffected")
 	assert.Len(t, failures, 1)
 }
@@ -510,7 +510,7 @@ func TestEmailPasswordFlowsShareValuesAndRunWithoutARequest(t *testing.T) {
 	require.NoError(t, err)
 
 	p := emailpassword.New(emailpassword.Options{})
-	_, err = p.SignUp(ctx, behemoth.M{"email": "early@example.com", "password": "correct horse"})
+	_, err = p.SignUp(ctx, behemoth.M{"email": "early@example.com", "password": "my-primus-stove"})
 	assert.True(t, errs.IsCategory(err, errs.CategoryConfiguration), "a flow called before Boot is a configuration error: %v", err)
 
 	app, err := engine.Prepare([]core.Plugin{p}, engine.PrepareConfig{})
@@ -580,7 +580,7 @@ func TestEmailPasswordFlowsShareValuesAndRunWithoutARequest(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	user, err := p.SignUp(ctx, behemoth.M{"email": "ada@example.com", "password": "correct horse", "inviteCode": "ABC123"})
+	user, err := p.SignUp(ctx, behemoth.M{"email": "ada@example.com", "password": "my-primus-stove", "inviteCode": "ABC123"})
 	require.NoError(t, err)
 	require.NotEmpty(t, user.ID)
 
@@ -603,7 +603,7 @@ func TestEmailPasswordFlowsShareValuesAndRunWithoutARequest(t *testing.T) {
 	}, log, "the write sees the flow's note; the flow does not see the write's")
 
 	log = nil
-	result, err := p.SignIn(ctx, emailpassword.EmailAndPasswordCredentials{Email: "ada@example.com", Password: "correct horse"})
+	result, err := p.SignIn(ctx, emailpassword.EmailAndPasswordCredentials{Email: "ada@example.com", Password: "my-primus-stove"})
 	require.NoError(t, err, "sign-in works without an HTTP request")
 	assert.NotEmpty(t, result.RawToken)
 	assert.Empty(t, result.Session.IPAddress, "no request, no address")
@@ -624,7 +624,7 @@ func TestEmailPasswordFlowsShareValuesAndRunWithoutARequest(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sign-in/email", nil)
 	rctx := &httpapi.RequestContext{Request: req, Response: httpapi.NewResponseRecorder(), Values: behemoth.M{}}
 	_, err = p.SignIn(httpapi.ContextWithRequest(req.Context(), rctx),
-		emailpassword.EmailAndPasswordCredentials{Email: "ada@example.com", Password: "correct horse"})
+		emailpassword.EmailAndPasswordCredentials{Email: "ada@example.com", Password: "my-primus-stove"})
 	require.NoError(t, err)
 	for _, s := range log {
 		assert.True(t, s.hasReq, "%s: the request on the context reaches the handler", s.point)
@@ -648,40 +648,40 @@ func TestEmailPasswordSignInPassesExtraInputToBeforeHandlers(t *testing.T) {
 			return nil, nil
 		}, nil)
 	})
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
 	t.Run("from the route", func(t *testing.T) {
 		payloads = nil
-		w := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse","captchaToken":"ok","device":{"id":"d1"}}`)
+		w := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove","captchaToken":"ok","device":{"id":"d1"}}`)
 		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		assert.Equal(t, []behemoth.M{{
-			"email": "ada@example.com", "password": "correct horse",
+			"email": "ada@example.com", "password": "my-primus-stove",
 			"captchaToken": "ok", "device": map[string]any{"id": "d1"},
 		}}, payloads)
 	})
 	t.Run("a handler rejects on an extra field", func(t *testing.T) {
-		w := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse","captchaToken":"bad"}`)
+		w := call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove","captchaToken":"bad"}`)
 		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 	})
 	t.Run("from code", func(t *testing.T) {
 		payloads = nil
 		extra := behemoth.M{"captchaToken": "ok", "email": "someone@else.example"}
 		_, err := p.SignIn(context.Background(), emailpassword.EmailAndPasswordCredentials{
-			Email: "ada@example.com", Password: "correct horse", Extra: extra,
+			Email: "ada@example.com", Password: "my-primus-stove", Extra: extra,
 		})
 		require.NoError(t, err)
-		assert.Equal(t, []behemoth.M{{"email": "ada@example.com", "password": "correct horse", "captchaToken": "ok"}}, payloads,
+		assert.Equal(t, []behemoth.M{{"email": "ada@example.com", "password": "my-primus-stove", "captchaToken": "ok"}}, payloads,
 			"the Email field wins over an Extra key of the same name")
 	})
 	t.Run("an email that is not a string", func(t *testing.T) {
 		payloads = nil
-		w := call(t, ac, routes["/sign-in/email"], `{"email":5,"password":"correct horse"}`)
+		w := call(t, ac, routes["/sign-in/email"], `{"email":5,"password":"my-primus-stove"}`)
 		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 		assert.Empty(t, payloads, "refused before the before chain")
 	})
 	t.Run("no email", func(t *testing.T) {
-		w := call(t, ac, routes["/sign-in/email"], `{"password":"correct horse"}`)
+		w := call(t, ac, routes["/sign-in/email"], `{"password":"my-primus-stove"}`)
 		assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 	})
 }
@@ -771,7 +771,7 @@ func TestSignInRouteIsRateLimited(t *testing.T) {
 	signUp := mounted["/api/auth/sign-up/email"]
 	require.NotNil(t, signUp.Handler)
 	register := func(i int) *httptest.ResponseRecorder {
-		body := fmt.Sprintf(`{"email":"user%d@example.com","password":"correct horse"}`, i)
+		body := fmt.Sprintf(`{"email":"user%d@example.com","password":"my-primus-stove"}`, i)
 		req := httptest.NewRequest(http.MethodPost, signUp.Path, strings.NewReader(body))
 		req.RemoteAddr = "203.0.113.7:50002"
 		rctx := &httpapi.RequestContext{Request: req, Response: httpapi.NewResponseRecorder(), Values: behemoth.M{}}
@@ -941,11 +941,11 @@ CREATE TABLE tokens (
 	limited := func(err error) bool { return errs.IsCategory(err, errs.CategoryRateLimited) }
 
 	// Sign-up: one per email, counted on the normalized form.
-	user, err := p.SignUp(ctx, behemoth.M{"email": "ada@example.com", "password": "correct horse"})
+	user, err := p.SignUp(ctx, behemoth.M{"email": "ada@example.com", "password": "my-primus-stove"})
 	require.NoError(t, err)
-	_, err = p.SignUp(ctx, behemoth.M{"email": "  ADA@Example.com ", "password": "correct horse"})
+	_, err = p.SignUp(ctx, behemoth.M{"email": "  ADA@Example.com ", "password": "my-primus-stove"})
 	assert.True(t, limited(err), "the same email in another spelling shares the count: %v", err)
-	_, err = p.SignUp(ctx, behemoth.M{"email": "grace@example.com", "password": "correct horse"})
+	_, err = p.SignUp(ctx, behemoth.M{"email": "grace@example.com", "password": "my-primus-stove"})
 	require.NoError(t, err, "another email has its own count")
 
 	// Sign-in: two per email, whatever the password and the outcome.
@@ -953,12 +953,12 @@ CREATE TABLE tokens (
 		_, err := p.SignIn(ctx, emailpassword.EmailAndPasswordCredentials{Email: email, Password: password})
 		return err
 	}
-	require.NoError(t, signIn("ada@example.com", "correct horse"))
+	require.NoError(t, signIn("ada@example.com", "my-primus-stove"))
 	err = signIn(" Ada@Example.com", "a wrong password")
 	assert.True(t, errs.IsCategory(err, errs.CategoryUnauthorized), "the second attempt reaches the flow: %v", err)
-	assert.True(t, limited(signIn("ada@example.com", "correct horse")), "the third attempt on the email is refused")
-	require.NoError(t, signIn("grace@example.com", "correct horse"), "another email has its own count")
-	require.NoError(t, signIn("alias@example.com", "correct horse"), "counted under the email that was sent, signed in as the rewritten one")
+	assert.True(t, limited(signIn("ada@example.com", "my-primus-stove")), "the third attempt on the email is refused")
+	require.NoError(t, signIn("grace@example.com", "my-primus-stove"), "another email has its own count")
+	require.NoError(t, signIn("alias@example.com", "my-primus-stove"), "counted under the email that was sent, signed in as the rewritten one")
 	for i := 1; i <= 3; i++ {
 		err = signIn(" ", "a wrong password")
 		assert.True(t, errs.IsCategory(err, errs.CategoryUnauthorized), "attempt %d without an email is not counted by the rule per email: %v", i, err)
@@ -1038,10 +1038,10 @@ func TestEmailPasswordOptions(t *testing.T) {
 				return nil
 			},
 		}
-		assert.Equal(t, ok, signUp(t, opts, `{"email":"a@example.com","password":"correct horse"}`))
+		assert.Equal(t, ok, signUp(t, opts, `{"email":"a@example.com","password":"my-primus-stove"}`))
 		assert.Equal(t, rejected, signUp(t, opts, `{"email":"a@example.com","password":"12345678"}`), "below the custom minimum")
 		assert.Equal(t, rejected, signUp(t, opts, `{"email":"a@example.com","password":"password-password"}`), "the extra check")
-		assert.Equal(t, rejected, signUp(t, opts, `{"email":"a@other.org","password":"correct horse"}`), "the custom email check")
+		assert.Equal(t, rejected, signUp(t, opts, `{"email":"a@other.org","password":"my-primus-stove"}`), "the custom email check")
 	})
 	t.Run("contradicting limits fail Init", func(t *testing.T) {
 		p := emailpassword.New(emailpassword.Options{MinPasswordLength: 20, MaxPasswordLength: 10})
@@ -1099,7 +1099,7 @@ func TestEmailPasswordLogging(t *testing.T) {
 	for _, r := range p.Routes() {
 		routes[r.Path] = r
 	}
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
 	// The sign-up's statements were logged, including the insert that ran
@@ -1135,7 +1135,7 @@ func TestEmailPasswordLogging(t *testing.T) {
 	// With the database gone, the sign-in fails for a reason the client is
 	// not told. The router answers 500 and logs it, once.
 	require.NoError(t, db.Close())
-	w = viaRouter(`{"email":"ada@example.com","password":"correct horse"}`)
+	w = viaRouter(`{"email":"ada@example.com","password":"my-primus-stove"}`)
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.NotContains(t, w.Body.String(), "closed", "the response carries none of the error's text")
 	failed := rec.Logger.At(slog.LevelError)
@@ -1175,8 +1175,8 @@ func TestSessionCheckThroughTheRouter(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, http.StatusCreated,
-		call(t, ac, mounted["/api/auth/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`).Code)
-	w := call(t, ac, mounted["/api/auth/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+		call(t, ac, mounted["/api/auth/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`).Code)
+	w := call(t, ac, mounted["/api/auth/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	token := w.Header().Get(httpapi.SessionTokenHeader)
 	require.NotEmpty(t, token)
@@ -1275,11 +1275,11 @@ func TestAuditLogRecordsTheAuthFlows(t *testing.T) {
 		}, nil)
 	})
 
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"wrong password"}`)
 	call(t, ac, routes["/sign-in/email"], `{"email":"nobody@example.com","password":"whatever it is"}`)
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	user, err := ac.Store.FindUserByEmail(ctx, "ada@example.com")
@@ -1364,7 +1364,7 @@ func TestAuditEventRollsBackWithTheWrite(t *testing.T) {
 	})
 
 	route := routes["/sign-up/email"]
-	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(`{"email":"ada@example.com","password":"correct horse"}`))
+	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(`{"email":"ada@example.com","password":"my-primus-stove"}`))
 	req.Header.Set("X-Veto", "1")
 	rctx := &httpapi.RequestContext{Request: req, Response: httpapi.NewResponseRecorder(), Values: behemoth.M{}, Auth: ac, TokenCarrier: headerCarrier}
 	rctx.Ctx = httpapi.ContextWithRequest(req.Context(), rctx)
@@ -1383,7 +1383,7 @@ func TestAuditEventRollsBackWithTheWrite(t *testing.T) {
 	assert.Equal(t, "ada@example.com", refused.Events[0].Metadata["email"])
 
 	// Without the veto the same sign-up commits both.
-	w := call(t, ac, route, `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, route, `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	page, err = ac.Store.QueryAuditEvents(ctx, telemetry.AuditFilter{Types: []string{telemetry.AuditUserCreated}})
 	require.NoError(t, err)
@@ -1396,7 +1396,7 @@ func TestAuditRecorderChoices(t *testing.T) {
 	ctx := context.Background()
 	signUp := func(ac *core.AuthContext, routes map[string]httpapi.Route) {
 		t.Helper()
-		w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+		w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 		require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	}
 	stored := func(ac *core.AuthContext) int {
@@ -1448,10 +1448,10 @@ func TestEmailPasswordMetrics(t *testing.T) {
 	ac, routes := auditApp(t, tel, nil)
 	m := rec.Metrics
 
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 	call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"wrong password"}`)
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 	assert.EqualValues(t, 1, m.Count(telemetry.MetricSignUp, behemoth.M{telemetry.AttrOutcome: "success"}))
@@ -1501,7 +1501,7 @@ func TestEmailPasswordTracing(t *testing.T) {
 	})
 	tr := rec.Tracer
 
-	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w := call(t, ac, routes["/sign-up/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
 
 	under := func(span *telemetrytest.Span, ancestor string) bool {
@@ -1560,7 +1560,7 @@ func TestEmailPasswordTracing(t *testing.T) {
 		assert.NoError(t, s.Err(), "span %q failed", s.Name)
 	}
 
-	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"correct horse"}`)
+	w = call(t, ac, routes["/sign-in/email"], `{"email":"ada@example.com","password":"my-primus-stove"}`)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.Len(t, tr.Named(telemetry.SpanPasswordVerify), 1)
 	creates := tr.Named(telemetry.SpanSessionCreate)

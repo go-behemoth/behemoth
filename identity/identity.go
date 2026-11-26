@@ -1,12 +1,12 @@
-// Package identity says who an operation runs for and where the call came
-// from: the Caller, which flows, hook handlers, and rate-limit rules read
-// from the context. A transport builds the caller of a call through an
-// authenticator, and code in the process names itself with System. The zero
-// Caller is anonymous and holds no permission, so a call that nobody
-// identified is never trusted.
+// Package identity defines who an operation runs as and where the call
+// originates. Flows, hook handlers, and rate-limit rules read the Caller
+// from the context. Transports establish callers through an authenticator,
+// while code running inside the process identifies itself using System.
+// The zero Caller represents an anonymous user with no permissions, ensuring
+// unidentified calls are never trusted.
 //
-// identity imports no other Behemoth package, so that every package can read
-// the caller.
+// This package has no dependencies on other Behemoth packages, allowing
+// any package to access the caller.
 package identity
 
 import (
@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// PrincipalType says what kind of identity a Principal names.
+// PrincipalType defines what kind of identity a Principal names.
 type PrincipalType string
 
 const (
@@ -24,7 +24,8 @@ const (
 	PrincipalSystem  PrincipalType = "system"  // ID names code in the process, such as "purge-sessions"
 )
 
-// Principal is who an operation runs for. The zero value is nobody.
+// Principal identifies who an operation runs on behalf of.
+// The zero value represents no principal.
 type Principal struct {
 	Type PrincipalType
 	ID   string
@@ -33,30 +34,33 @@ type Principal struct {
 // IsZero reports whether p names nobody.
 func (p Principal) IsZero() bool { return p.Type == "" }
 
-// SessionRef is the session a caller was authenticated with, as plain data:
-// what flows and the audit log read of it, and no secret.
+// SessionRef describes the session used to authenticate a caller. It
+// contains only the data needed by flows and the audit log, never secrets.
 type SessionRef struct {
 	ID             string
 	UserID         string
 	State          string // "active", or "pending" while a second factor is outstanding
 	ExpiresAt      time.Time
 	FreshAt        time.Time // when the user last proved a credential
-	Factors        []string  // what the session's sign-in proved, in order: core's Factor names, such as "password"
-	ImpersonatorID string    // the user who impersonates UserID, if any
+	Factors        []string  // Sign-in factors, in order using core's Factor names (e.g. "password")
+	ImpersonatorID string    // ID of the user impersonating UserID, if any
 }
 
-// Peer is what a transport knows about a call besides its credential.
+// Peer describes what the transport knows about a request beyond its
+// credentials.
 type Peer struct {
-	Transport string // the protocol the call arrived by, such as "http"; empty for a call from code in the process
+	Transport string // The protocol used , such as "http"; empty for in-process calls.
 	IPAddress string // the client's address, resolved with the trusted proxies
 	UserAgent string
 }
 
-// Caller is who an operation runs for, and where the call came from. Its
-// fields are unexported: a caller comes from System, from For, or from an
-// authenticator, through Anonymous, Unauthenticated, or SignedIn. The zero
-// value is an anonymous caller about which nothing is known, and it holds no
-// permission.
+// Caller identifies who an operation runs for and where the request
+// originated. Its fields are unexported so callers can only be created
+// through System, For, or an authenticator using Anonymous,
+// Unauthenticated, or SignedIn.
+//
+// The zero value represents an anonymous caller with no known identity
+// or permissions.
 type Caller struct {
 	principal Principal
 	delegate  Principal
@@ -66,26 +70,26 @@ type Caller struct {
 	peer      Peer
 }
 
-// grant is the set of permissions a caller holds. The zero value holds none.
-// A grant that lists permissions one by one, for a delegated credential, is
-// not built: every caller holds either all of a kind or none of it.
+// grant represents the permissions a caller holds. Its zero value grants none.
+// Delegated credentials cannot specify individual permissions; callers either have
+// all permissions of a given kind or none.
 type grant struct {
-	self  bool // every self-service permission, over the principal's own account
-	admin bool // every admin permission
+	self  bool // all the self-service permission on the caller's account
+	admin bool // all admin permission
 }
 
 // Principal returns who the operation runs for. It is zero for an anonymous
 // caller.
 func (c Caller) Principal() Principal { return c.principal }
 
-// Delegate returns who acts for the principal when it isn't the principal
-// itself: the system for a job that acts for a user (For), or the user who
-// impersonates the principal. It is zero when the principal acts itself.
+// Delegate returns who acts on behalf of the principal, if anyone.
+// This is either the system acting for a user (For) or a user impersonating
+// the principal. It is zero when the principal acts on their own.
 func (c Caller) Delegate() Principal { return c.delegate }
 
-// Session returns the session the caller was authenticated with. ok is false
-// when there is none: for a system caller, a service, and an anonymous caller
-// without a session that waits for a second factor.
+// Session returns the session used to authenticate the user.
+// ok is false when no session exists, as with system and service callers,
+// or anonymous callers waiting for a second factor.
 func (c Caller) Session() (session SessionRef, ok bool) {
 	if c.session == nil {
 		return SessionRef{}, false
@@ -93,16 +97,16 @@ func (c Caller) Session() (session SessionRef, ok bool) {
 	return *c.session, true
 }
 
-// AuthError returns why the caller is anonymous although it presented a
-// credential, such as an expired session. It is nil for a caller that
-// presented none, and for a caller that authenticated.
+// AuthError returns the reason authentication failed when the caller presented
+// a credential, such as an expired session. It is nil if no credential was presented
+// or authentication succeeded.
 func (c Caller) AuthError() error { return c.authErr }
 
-// Peer returns what the transport knew about the call. It is zero for a call
-// from code in the process.
+// Peer returns the information the transport has about the caller. It is zero for
+// calls made from within the process.
 func (c Caller) Peer() Peer { return c.peer }
 
-// IsAnonymous reports whether the caller authenticated as nobody.
+// IsAnonymous reports whether the caller has no authenticated identity.
 func (c Caller) IsAnonymous() bool { return c.principal.IsZero() }
 
 // Holds reports whether the caller holds permission. admin says whether the
@@ -155,12 +159,11 @@ func Anonymous(peer Peer) Caller {
 	return Caller{peer: peer}
 }
 
-// Unauthenticated returns the caller of a call whose credential
-// authenticated nobody. reason says why, and is what a flow that requires a
-// user returns: the session error of an invalid, revoked, expired, or pending
-// session, or the failure of the lookup. pending is the session of a
-// credential that waits for a second factor, so that a second-factor flow
-// can find it, or nil.
+// Unauthenticated returns a caller whose credential did not identify anyone.
+// reason explains why authentication failed. It is returned to flows that
+// require a user and may be a session error (invalid, revoked, expired, or
+// pending) or a lookup failure. pending is the session awaiting a second
+// factor, if any, so that a second-factor flow can continue authentication.
 func Unauthenticated(peer Peer, reason error, pending *SessionRef) Caller {
 	c := Caller{peer: peer, authErr: reason}
 	if pending != nil {
@@ -170,11 +173,11 @@ func Unauthenticated(peer Peer, reason error, pending *SessionRef) Caller {
 	return c
 }
 
-// SignedIn returns the caller of a call that session authenticated: its
-// principal is the session's user, and it holds every self-service
-// permission over that account. When the session is an impersonation, the
-// impersonating user is the delegate. It is for an authenticator: within
-// Behemoth, only package auth calls it, and a test checks that.
+// SignedIn returns a caller authenticated by a session. The session's user
+// becomes the principal and receives all self-service permissions on their
+// account. If the session represents an impersonation, the impersonating user
+// becomes the delegate. This constructor is intended for authenticators;
+// within Behemoth, only package auth may call it, enforced by a test.
 func SignedIn(session SessionRef, peer Peer) Caller {
 	s := session
 	c := Caller{
@@ -191,9 +194,10 @@ func SignedIn(session SessionRef, peer Peer) Caller {
 
 type callerKey struct{}
 
-// WithCaller returns ctx carrying c. A transport calls it once per call, with
-// the caller its authenticator built, and replaces any caller ctx carried.
-// Code in the process calls it with System, or with System(...).For(userID).
+// WithCaller returns ctx with c attached, replacing any existing caller.
+// Transports call it once per request with the caller built by their
+// authenticator. Code running in the process uses System or
+// System(...).For(userID).
 func WithCaller(ctx context.Context, c Caller) context.Context {
 	return context.WithValue(ctx, callerKey{}, c)
 }
